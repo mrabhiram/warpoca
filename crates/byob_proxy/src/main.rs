@@ -2273,6 +2273,9 @@ fn warp_tool_instructions() -> &'static str {
      - Use run_shell_command for terminal commands. Prefer read-only commands unless mutation is required.\n\
      - When run_shell_command returns a long-running snapshot, use read_shell_command_output with the returned command_id to monitor it. Use delay_seconds for periodic checks and wait_until_complete when you need the final result.\n\
      - Use write_to_lrc only when a running command needs terminal input. Use transfer_shell_command_control when the command requires secret, interactive, or human-only input.\n\
+     - Use read_files, grep, file_glob_v2, and search_codebase to gather local project context through Warp's native file/search UI.\n\
+     - Use read_skill when the request references a Warp/Codex skill and Warp advertises that tool.\n\
+     - Use ask_user_question when progress depends on a user choice. Keep questions concrete and options short.\n\
      - Use apply_file_diffs for file edits. Prefer v4a_updates when possible; otherwise use exact search/replace diffs.\n\
      - Use suggest_prompt for passive prompt chips or inline query banners when Warp asks for passive suggestions.\n\
      - Use suggest_rule only for durable rules the user may want to save for future agent runs.\n\
@@ -2376,6 +2379,202 @@ fn build_tool_definitions(request: &api::Request) -> Vec<OpenAITool> {
                         "reason": {
                             "type": "string",
                             "description": "A concise explanation of why the user must take over."
+                        }
+                    }
+                }),
+            },
+        });
+    }
+    if supports_tool(request, api::ToolType::ReadFiles) {
+        tools.push(OpenAITool {
+            r#type: "function",
+            function: OpenAIFunctionDefinition {
+                name: "read_files",
+                description:
+                    "Ask Warp to read one or more local files, optionally limited to line ranges.",
+                parameters: json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["files"],
+                    "properties": {
+                        "files": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": ["path"],
+                                "properties": {
+                                    "path": { "type": "string" },
+                                    "line_ranges": {
+                                        "type": "array",
+                                        "items": {
+                                            "type": "object",
+                                            "additionalProperties": false,
+                                            "required": ["start", "end"],
+                                            "properties": {
+                                                "start": { "type": "integer", "minimum": 1 },
+                                                "end": { "type": "integer", "minimum": 1 }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }),
+            },
+        });
+    }
+    if supports_tool(request, api::ToolType::SearchCodebase) {
+        tools.push(OpenAITool {
+            r#type: "function",
+            function: OpenAIFunctionDefinition {
+                name: "search_codebase",
+                description:
+                    "Ask Warp to search the current indexed codebase for relevant file snippets.",
+                parameters: json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["query"],
+                    "properties": {
+                        "query": { "type": "string" },
+                        "path_filters": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        },
+                        "codebase_path": {
+                            "type": "string",
+                            "description": "Optional absolute path to the codebase to search."
+                        }
+                    }
+                }),
+            },
+        });
+    }
+    if supports_tool(request, api::ToolType::Grep) {
+        tools.push(OpenAITool {
+            r#type: "function",
+            function: OpenAIFunctionDefinition {
+                name: "grep",
+                description: "Ask Warp to grep local files for one or more literal strings or regex patterns.",
+                parameters: json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "query": { "type": "string" },
+                        "queries": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "Relative file or directory to search. Empty means current project."
+                        }
+                    }
+                }),
+            },
+        });
+    }
+    if supports_tool(request, api::ToolType::FileGlobV2) {
+        tools.push(OpenAITool {
+            r#type: "function",
+            function: OpenAIFunctionDefinition {
+                name: "file_glob_v2",
+                description: "Ask Warp to find files by filename glob patterns.",
+                parameters: json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["patterns"],
+                    "properties": {
+                        "patterns": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        },
+                        "search_dir": {
+                            "type": "string",
+                            "description": "Relative directory to search. Empty means current project."
+                        },
+                        "max_matches": { "type": "integer", "minimum": 0 },
+                        "max_depth": { "type": "integer", "minimum": 0 },
+                        "min_depth": { "type": "integer", "minimum": 0 }
+                    }
+                }),
+            },
+        });
+    } else if supports_tool(request, api::ToolType::FileGlob) {
+        tools.push(OpenAITool {
+            r#type: "function",
+            function: OpenAIFunctionDefinition {
+                name: "file_glob",
+                description: "Ask Warp to find files by filename glob patterns.",
+                parameters: json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["patterns"],
+                    "properties": {
+                        "patterns": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "Relative directory to search. Empty means current project."
+                        }
+                    }
+                }),
+            },
+        });
+    }
+    if supports_tool(request, api::ToolType::ReadSkill) {
+        tools.push(OpenAITool {
+            r#type: "function",
+            function: OpenAIFunctionDefinition {
+                name: "read_skill",
+                description: "Ask Warp to read a skill by local SKILL.md path or bundled skill id.",
+                parameters: json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "skill_path": { "type": "string" },
+                        "bundled_skill_id": { "type": "string" },
+                        "name": { "type": "string" }
+                    }
+                }),
+            },
+        });
+    }
+    if supports_tool(request, api::ToolType::AskUserQuestion) {
+        tools.push(OpenAITool {
+            r#type: "function",
+            function: OpenAIFunctionDefinition {
+                name: "ask_user_question",
+                description: "Ask Warp to show one or more multiple-choice questions to the user.",
+                parameters: json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["questions"],
+                    "properties": {
+                        "questions": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": ["question", "options"],
+                                "properties": {
+                                    "question_id": { "type": "string" },
+                                    "question": { "type": "string" },
+                                    "options": {
+                                        "type": "array",
+                                        "items": { "type": "string" }
+                                    },
+                                    "recommended_option_index": {
+                                        "type": "integer",
+                                        "description": "Zero-based index. Use -1 for no recommendation."
+                                    },
+                                    "is_multiselect": { "type": "boolean", "default": false },
+                                    "supports_other": { "type": "boolean", "default": false }
+                                }
+                            }
                         }
                     }
                 }),
@@ -2905,6 +3104,7 @@ fn format_running_command(command: &api::RunningShellCommand) -> String {
     format!("command: {}\n{snapshot}", command.command)
 }
 
+#[allow(deprecated)]
 fn warp_tool_call_to_openai(tool_call: &api::message::ToolCall) -> Option<OpenAIMessageToolCall> {
     let (name, arguments) = match tool_call.tool.as_ref()? {
         api::message::tool_call::Tool::RunShellCommand(command) => (
@@ -2939,6 +3139,90 @@ fn warp_tool_call_to_openai(tool_call: &api::message::ToolCall) -> Option<OpenAI
             "transfer_shell_command_control",
             json!({
                 "reason": transfer.reason,
+            }),
+        ),
+        api::message::tool_call::Tool::ReadFiles(read_files) => (
+            "read_files",
+            json!({
+                "files": read_files.files.iter().map(|file| json!({
+                    "path": file.name,
+                    "line_ranges": file.line_ranges.iter().map(|range| json!({
+                        "start": range.start,
+                        "end": range.end,
+                    })).collect::<Vec<_>>(),
+                })).collect::<Vec<_>>(),
+            }),
+        ),
+        api::message::tool_call::Tool::SearchCodebase(search) => (
+            "search_codebase",
+            json!({
+                "query": search.query,
+                "path_filters": search.path_filters,
+                "codebase_path": search.codebase_path,
+            }),
+        ),
+        api::message::tool_call::Tool::Grep(grep) => (
+            "grep",
+            json!({
+                "queries": grep.queries,
+                "path": grep.path,
+            }),
+        ),
+        api::message::tool_call::Tool::FileGlob(glob) => (
+            "file_glob",
+            json!({
+                "patterns": glob.patterns,
+                "path": glob.path,
+            }),
+        ),
+        api::message::tool_call::Tool::FileGlobV2(glob) => (
+            "file_glob_v2",
+            json!({
+                "patterns": glob.patterns,
+                "search_dir": glob.search_dir,
+                "max_matches": glob.max_matches,
+                "max_depth": glob.max_depth,
+                "min_depth": glob.min_depth,
+            }),
+        ),
+        api::message::tool_call::Tool::ReadSkill(read_skill) => {
+            let (skill_path, bundled_skill_id) = match read_skill.skill_reference.as_ref() {
+                Some(api::message::tool_call::read_skill::SkillReference::SkillPath(path)) => {
+                    (path.clone(), String::new())
+                }
+                Some(api::message::tool_call::read_skill::SkillReference::BundledSkillId(id)) => {
+                    (String::new(), id.clone())
+                }
+                None => (String::new(), String::new()),
+            };
+            (
+                "read_skill",
+                json!({
+                    "skill_path": skill_path,
+                    "bundled_skill_id": bundled_skill_id,
+                    "name": read_skill.name,
+                }),
+            )
+        }
+        api::message::tool_call::Tool::AskUserQuestion(ask) => (
+            "ask_user_question",
+            json!({
+                "questions": ask.questions.iter().map(|question| {
+                    let multiple_choice = match question.question_type.as_ref() {
+                        Some(api::ask_user_question::question::QuestionType::MultipleChoice(choice)) => Some(choice),
+                        None => None,
+                    };
+                    json!({
+                        "question_id": question.question_id,
+                        "question": question.question,
+                        "options": multiple_choice
+                            .map(|choice| choice.options.iter().map(|option| option.label.clone()).collect::<Vec<_>>())
+                            .unwrap_or_default(),
+                        "recommended_option_index": multiple_choice.map(|choice| choice.recommended_option_index).unwrap_or(-1),
+                        "is_multiselect": multiple_choice.map(|choice| choice.is_multiselect).unwrap_or(false),
+                        "supports_other": multiple_choice.map(|choice| choice.supports_other).unwrap_or(false),
+                    })
+                }).collect::<Vec<_>>(),
             }),
         ),
         api::message::tool_call::Tool::ApplyFileDiffs(diffs) => (
@@ -3004,6 +3288,7 @@ fn write_to_lrc_mode_name(
     }
 }
 
+#[allow(deprecated)]
 fn format_tool_call_result(result: &api::message::ToolCallResult) -> String {
     match &result.result {
         Some(api::message::tool_call_result::Result::RunShellCommand(result)) => {
@@ -3017,6 +3302,25 @@ fn format_tool_call_result(result: &api::message::ToolCallResult) -> String {
         }
         Some(api::message::tool_call_result::Result::TransferShellCommandControlToUser(result)) => {
             format_transfer_shell_control_result(result)
+        }
+        Some(api::message::tool_call_result::Result::ReadFiles(result)) => {
+            format_read_files_result(result)
+        }
+        Some(api::message::tool_call_result::Result::SearchCodebase(result)) => {
+            format_search_codebase_result(result)
+        }
+        Some(api::message::tool_call_result::Result::Grep(result)) => format_grep_result(result),
+        Some(api::message::tool_call_result::Result::FileGlob(result)) => {
+            format_file_glob_result(result)
+        }
+        Some(api::message::tool_call_result::Result::FileGlobV2(result)) => {
+            format_file_glob_v2_result(result)
+        }
+        Some(api::message::tool_call_result::Result::ReadSkill(result)) => {
+            format_read_skill_result(result)
+        }
+        Some(api::message::tool_call_result::Result::AskUserQuestion(result)) => {
+            format_ask_user_question_result(result)
         }
         Some(api::message::tool_call_result::Result::ApplyFileDiffs(result)) => {
             format_apply_file_diffs_result(result)
@@ -3040,6 +3344,27 @@ fn format_request_tool_call_result(result: &api::request::input::ToolCallResult)
         Some(api::request::input::tool_call_result::Result::TransferShellCommandControlToUser(
             result,
         )) => format_transfer_shell_control_result(result),
+        Some(api::request::input::tool_call_result::Result::ReadFiles(result)) => {
+            format_read_files_result(result)
+        }
+        Some(api::request::input::tool_call_result::Result::SearchCodebase(result)) => {
+            format_search_codebase_result(result)
+        }
+        Some(api::request::input::tool_call_result::Result::Grep(result)) => {
+            format_grep_result(result)
+        }
+        Some(api::request::input::tool_call_result::Result::FileGlob(result)) => {
+            format_file_glob_result(result)
+        }
+        Some(api::request::input::tool_call_result::Result::FileGlobV2(result)) => {
+            format_file_glob_v2_result(result)
+        }
+        Some(api::request::input::tool_call_result::Result::ReadSkill(result)) => {
+            format_read_skill_result(result)
+        }
+        Some(api::request::input::tool_call_result::Result::AskUserQuestion(result)) => {
+            format_ask_user_question_result(result)
+        }
         Some(api::request::input::tool_call_result::Result::ApplyFileDiffs(result)) => {
             format_apply_file_diffs_result(result)
         }
@@ -3134,6 +3459,211 @@ fn format_transfer_shell_control_result(
             format_shell_error("transfer_shell_command_control", error)
         }
         None => "transfer_shell_command_control returned no result.".to_string(),
+    }
+}
+
+fn format_read_files_result(result: &api::ReadFilesResult) -> String {
+    match &result.result {
+        Some(api::read_files_result::Result::TextFilesSuccess(success)) => {
+            format_file_contents("read_files", success.files.iter())
+        }
+        Some(api::read_files_result::Result::AnyFilesSuccess(success)) => {
+            let files = success
+                .files
+                .iter()
+                .map(format_any_file_content)
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            if files.is_empty() {
+                "read_files returned no files.".to_string()
+            } else {
+                format!("read_files result:\n{files}")
+            }
+        }
+        Some(api::read_files_result::Result::Error(error)) => {
+            format!("read_files failed: {}", error.message)
+        }
+        None => "read_files returned no result.".to_string(),
+    }
+}
+
+fn format_search_codebase_result(result: &api::SearchCodebaseResult) -> String {
+    match &result.result {
+        Some(api::search_codebase_result::Result::Success(success)) => {
+            format_file_contents("search_codebase", success.files.iter())
+        }
+        Some(api::search_codebase_result::Result::Error(error)) => {
+            format!("search_codebase failed: {}", error.message)
+        }
+        None => "search_codebase returned no result.".to_string(),
+    }
+}
+
+fn format_grep_result(result: &api::GrepResult) -> String {
+    match &result.result {
+        Some(api::grep_result::Result::Success(success)) => {
+            let files = success
+                .matched_files
+                .iter()
+                .map(|file| {
+                    let lines = file
+                        .matched_lines
+                        .iter()
+                        .map(|line| line.line_number.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("{}: lines [{}]", file.file_path, lines)
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            if files.is_empty() {
+                "grep found no matches.".to_string()
+            } else {
+                format!("grep matches:\n{files}")
+            }
+        }
+        Some(api::grep_result::Result::Error(error)) => {
+            format!("grep failed: {}", error.message)
+        }
+        None => "grep returned no result.".to_string(),
+    }
+}
+
+fn format_file_glob_result(result: &api::FileGlobResult) -> String {
+    match &result.result {
+        Some(api::file_glob_result::Result::Success(success)) => {
+            format!("file_glob matches:\n{}", success.matched_files)
+        }
+        Some(api::file_glob_result::Result::Error(error)) => {
+            format!("file_glob failed: {}", error.message)
+        }
+        None => "file_glob returned no result.".to_string(),
+    }
+}
+
+fn format_file_glob_v2_result(result: &api::FileGlobV2Result) -> String {
+    match &result.result {
+        Some(api::file_glob_v2_result::Result::Success(success)) => {
+            let files = success
+                .matched_files
+                .iter()
+                .map(|file| file.file_path.clone())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let warnings = if success.warnings.trim().is_empty() {
+                String::new()
+            } else {
+                format!("\nwarnings:\n{}", success.warnings)
+            };
+            if files.is_empty() {
+                format!("file_glob_v2 found no matches.{warnings}")
+            } else {
+                format!("file_glob_v2 matches:\n{files}{warnings}")
+            }
+        }
+        Some(api::file_glob_v2_result::Result::Error(error)) => {
+            format!("file_glob_v2 failed: {}", error.message)
+        }
+        None => "file_glob_v2 returned no result.".to_string(),
+    }
+}
+
+fn format_read_skill_result(result: &api::ReadSkillResult) -> String {
+    match &result.result {
+        Some(api::read_skill_result::Result::Success(success)) => success
+            .content
+            .as_ref()
+            .map(|content| format!("read_skill result:\n{}", format_file_content(content)))
+            .unwrap_or_else(|| "read_skill returned success without content.".to_string()),
+        Some(api::read_skill_result::Result::Error(error)) => {
+            format!("read_skill failed: {}", error.message)
+        }
+        None => "read_skill returned no result.".to_string(),
+    }
+}
+
+fn format_ask_user_question_result(result: &api::AskUserQuestionResult) -> String {
+    match &result.result {
+        Some(api::ask_user_question_result::Result::Success(success)) => {
+            let answers = success
+                .answers
+                .iter()
+                .map(format_answer_item)
+                .collect::<Vec<_>>()
+                .join("\n");
+            if answers.is_empty() {
+                "ask_user_question completed with no answers.".to_string()
+            } else {
+                format!("ask_user_question answers:\n{answers}")
+            }
+        }
+        Some(api::ask_user_question_result::Result::Error(error)) => {
+            format!("ask_user_question failed: {}", error.message)
+        }
+        None => "ask_user_question returned no result.".to_string(),
+    }
+}
+
+fn format_file_contents<'a>(
+    tool_name: &str,
+    files: impl Iterator<Item = &'a api::FileContent>,
+) -> String {
+    let files = files
+        .map(format_file_content)
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if files.is_empty() {
+        format!("{tool_name} returned no files.")
+    } else {
+        format!("{tool_name} result:\n{files}")
+    }
+}
+
+fn format_any_file_content(content: &api::AnyFileContent) -> String {
+    match content.content.as_ref() {
+        Some(api::any_file_content::Content::TextContent(file)) => format_file_content(file),
+        Some(api::any_file_content::Content::BinaryContent(file)) => {
+            format!(
+                "binary file: {}\nbytes: {}",
+                file.file_path,
+                file.data.len()
+            )
+        }
+        None => "empty file content".to_string(),
+    }
+}
+
+fn format_file_content(file: &api::FileContent) -> String {
+    let range = file
+        .line_range
+        .as_ref()
+        .map(|range| format!(" lines {}-{}", range.start, range.end))
+        .unwrap_or_default();
+    format!(
+        "file: {}{}\n{}",
+        file.file_path,
+        range,
+        truncate(&file.content, 12000)
+    )
+}
+
+fn format_answer_item(answer: &api::ask_user_question_result::AnswerItem) -> String {
+    match answer.answer.as_ref() {
+        Some(api::ask_user_question_result::answer_item::Answer::MultipleChoice(choice)) => {
+            let selected = choice.selected_options.join(", ");
+            if choice.other_text.trim().is_empty() {
+                format!("{}: {}", answer.question_id, selected)
+            } else {
+                format!(
+                    "{}: {} other={}",
+                    answer.question_id, selected, choice.other_text
+                )
+            }
+        }
+        Some(api::ask_user_question_result::answer_item::Answer::Skipped(_)) => {
+            format!("{}: skipped", answer.question_id)
+        }
+        None => format!("{}: no answer", answer.question_id),
     }
 }
 
@@ -3608,6 +4138,7 @@ struct ToolCallAccumulator {
 }
 
 impl ToolCallAccumulator {
+    #[allow(deprecated)]
     fn into_warp_client_output(self) -> anyhow::Result<WarpClientOutput> {
         let name = self
             .name
@@ -3663,6 +4194,71 @@ impl ToolCallAccumulator {
                         reason: args.reason,
                     },
                 )
+            }
+            "read_files" => {
+                let args: ReadFilesArgs = serde_json::from_str(&self.arguments)?;
+                api::message::tool_call::Tool::ReadFiles(api::message::tool_call::ReadFiles {
+                    files: args
+                        .files
+                        .into_iter()
+                        .map(|file| {
+                            let ReadFileArg { name, line_ranges } = file;
+                            api::message::tool_call::read_files::File {
+                                name: name.unwrap_or_default(),
+                                line_ranges: line_ranges.into_iter().map(Into::into).collect(),
+                            }
+                        })
+                        .collect(),
+                })
+            }
+            "search_codebase" => {
+                let args: SearchCodebaseArgs = serde_json::from_str(&self.arguments)?;
+                api::message::tool_call::Tool::SearchCodebase(
+                    api::message::tool_call::SearchCodebase {
+                        query: args.query,
+                        path_filters: args.path_filters,
+                        codebase_path: args.codebase_path.unwrap_or_default(),
+                    },
+                )
+            }
+            "grep" => {
+                let args: GrepArgs = serde_json::from_str(&self.arguments)?;
+                let path = args.path.clone().unwrap_or_default();
+                api::message::tool_call::Tool::Grep(api::message::tool_call::Grep {
+                    queries: args.queries(),
+                    path,
+                })
+            }
+            "file_glob" => {
+                let args: FileGlobArgs = serde_json::from_str(&self.arguments)?;
+                api::message::tool_call::Tool::FileGlob(api::message::tool_call::FileGlob {
+                    patterns: args.patterns,
+                    path: args.path.unwrap_or_default(),
+                })
+            }
+            "file_glob_v2" => {
+                let args: FileGlobV2Args = serde_json::from_str(&self.arguments)?;
+                api::message::tool_call::Tool::FileGlobV2(api::message::tool_call::FileGlobV2 {
+                    patterns: args.patterns,
+                    search_dir: args.search_dir.unwrap_or_default(),
+                    max_matches: args.max_matches.unwrap_or_default(),
+                    max_depth: args.max_depth.unwrap_or_default(),
+                    min_depth: args.min_depth.unwrap_or_default(),
+                })
+            }
+            "read_skill" => {
+                let args: ReadSkillArgs = serde_json::from_str(&self.arguments)?;
+                let name = args.name.clone().unwrap_or_default();
+                api::message::tool_call::Tool::ReadSkill(api::message::tool_call::ReadSkill {
+                    name,
+                    skill_reference: Some(args.skill_reference()?),
+                })
+            }
+            "ask_user_question" => {
+                let args: AskUserQuestionArgs = serde_json::from_str(&self.arguments)?;
+                api::message::tool_call::Tool::AskUserQuestion(api::AskUserQuestion {
+                    questions: args.questions.into_iter().map(Into::into).collect(),
+                })
             }
             "apply_file_diffs" => {
                 let args: ApplyFileDiffsArgs = serde_json::from_str(&self.arguments)?;
@@ -3816,6 +4412,143 @@ impl WriteToLongRunningShellCommandArgs {
 #[derive(Debug, Deserialize)]
 struct TransferShellCommandControlArgs {
     reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReadFilesArgs {
+    files: Vec<ReadFileArg>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReadFileArg {
+    #[serde(alias = "path", alias = "file_path")]
+    name: Option<String>,
+    #[serde(default)]
+    line_ranges: Vec<LineRangeArg>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LineRangeArg {
+    start: u32,
+    end: u32,
+}
+
+impl From<LineRangeArg> for api::FileContentLineRange {
+    fn from(value: LineRangeArg) -> Self {
+        Self {
+            start: value.start,
+            end: value.end,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchCodebaseArgs {
+    query: String,
+    #[serde(default)]
+    path_filters: Vec<String>,
+    codebase_path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GrepArgs {
+    query: Option<String>,
+    #[serde(default)]
+    queries: Vec<String>,
+    path: Option<String>,
+}
+
+impl GrepArgs {
+    fn queries(self) -> Vec<String> {
+        let mut queries = self.queries;
+        if let Some(query) = self.query.filter(|query| !query.trim().is_empty()) {
+            queries.push(query);
+        }
+        queries
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct FileGlobArgs {
+    patterns: Vec<String>,
+    path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FileGlobV2Args {
+    patterns: Vec<String>,
+    search_dir: Option<String>,
+    max_matches: Option<i32>,
+    max_depth: Option<i32>,
+    min_depth: Option<i32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReadSkillArgs {
+    skill_path: Option<String>,
+    bundled_skill_id: Option<String>,
+    name: Option<String>,
+}
+
+impl ReadSkillArgs {
+    fn skill_reference(
+        self,
+    ) -> anyhow::Result<api::message::tool_call::read_skill::SkillReference> {
+        if let Some(path) = self.skill_path.filter(|path| !path.trim().is_empty()) {
+            return Ok(api::message::tool_call::read_skill::SkillReference::SkillPath(path));
+        }
+
+        if let Some(id) = self.bundled_skill_id.filter(|id| !id.trim().is_empty()) {
+            return Ok(api::message::tool_call::read_skill::SkillReference::BundledSkillId(id));
+        }
+
+        anyhow::bail!("read_skill requires skill_path or bundled_skill_id")
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct AskUserQuestionArgs {
+    questions: Vec<AskUserQuestionArg>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AskUserQuestionArg {
+    question_id: Option<String>,
+    question: String,
+    options: Vec<String>,
+    recommended_option_index: Option<i32>,
+    #[serde(default)]
+    is_multiselect: bool,
+    #[serde(default)]
+    supports_other: bool,
+}
+
+impl From<AskUserQuestionArg> for api::ask_user_question::Question {
+    fn from(value: AskUserQuestionArg) -> Self {
+        let options = value
+            .options
+            .into_iter()
+            .map(|label| api::ask_user_question::Option { label })
+            .collect();
+
+        api::ask_user_question::Question {
+            question_id: value
+                .question_id
+                .filter(|id| !id.trim().is_empty())
+                .unwrap_or_else(|| format!("question_{}", Uuid::new_v4())),
+            question: value.question,
+            question_type: Some(
+                api::ask_user_question::question::QuestionType::MultipleChoice(
+                    api::ask_user_question::MultipleChoice {
+                        options,
+                        recommended_option_index: value.recommended_option_index.unwrap_or(-1),
+                        is_multiselect: value.is_multiselect,
+                        supports_other: value.supports_other,
+                    },
+                ),
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -4094,6 +4827,37 @@ mod tests {
     }
 
     #[test]
+    fn exposes_native_context_and_question_tools() {
+        let request = api::Request {
+            settings: Some(api::request::Settings {
+                supported_tools: vec![
+                    api::ToolType::ReadFiles as i32,
+                    api::ToolType::SearchCodebase as i32,
+                    api::ToolType::Grep as i32,
+                    api::ToolType::FileGlobV2 as i32,
+                    api::ToolType::ReadSkill as i32,
+                    api::ToolType::AskUserQuestion as i32,
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let tools = build_tool_definitions(&request);
+        let names = tools
+            .iter()
+            .map(|tool| tool.function.name)
+            .collect::<BTreeSet<_>>();
+
+        assert!(names.contains("read_files"));
+        assert!(names.contains("search_codebase"));
+        assert!(names.contains("grep"));
+        assert!(names.contains("file_glob_v2"));
+        assert!(names.contains("read_skill"));
+        assert!(names.contains("ask_user_question"));
+    }
+
+    #[test]
     fn encodes_warp_sse_data_as_decodable_response_event() {
         let event = finished_event_done();
         let encoded = BASE64_URL_SAFE.encode(event.encode_to_vec());
@@ -4236,6 +5000,96 @@ mod tests {
         assert!(matches!(
             calls[2].tool.as_ref(),
             Some(api::message::tool_call::Tool::TransferShellCommandControlToUser(_))
+        ));
+    }
+
+    #[test]
+    fn accumulates_context_and_question_tool_calls() {
+        let mut calls = ToolCallAccumulatorSet::default();
+        calls.apply_full_calls(vec![
+            OpenAIMessageToolCall {
+                id: "call_read_files".to_string(),
+                r#type: "function".to_string(),
+                function: OpenAIFunctionCall {
+                    name: "read_files".to_string(),
+                    arguments: r#"{"files":[{"path":"src/main.rs","line_ranges":[{"start":1,"end":20}]}]}"#.to_string(),
+                },
+            },
+            OpenAIMessageToolCall {
+                id: "call_search".to_string(),
+                r#type: "function".to_string(),
+                function: OpenAIFunctionCall {
+                    name: "search_codebase".to_string(),
+                    arguments: r#"{"query":"agent action conversion","path_filters":["crates/ai"]}"#
+                        .to_string(),
+                },
+            },
+            OpenAIMessageToolCall {
+                id: "call_grep".to_string(),
+                r#type: "function".to_string(),
+                function: OpenAIFunctionCall {
+                    name: "grep".to_string(),
+                    arguments: r#"{"query":"ToolCallAccumulator","path":"crates/byob_proxy"}"#
+                        .to_string(),
+                },
+            },
+            OpenAIMessageToolCall {
+                id: "call_glob".to_string(),
+                r#type: "function".to_string(),
+                function: OpenAIFunctionCall {
+                    name: "file_glob_v2".to_string(),
+                    arguments: r#"{"patterns":["*.rs"],"search_dir":"crates/byob_proxy","max_matches":10}"#
+                        .to_string(),
+                },
+            },
+            OpenAIMessageToolCall {
+                id: "call_skill".to_string(),
+                r#type: "function".to_string(),
+                function: OpenAIFunctionCall {
+                    name: "read_skill".to_string(),
+                    arguments: r#"{"skill_path":"/tmp/SKILL.md","name":"tmp"}"#.to_string(),
+                },
+            },
+            OpenAIMessageToolCall {
+                id: "call_question".to_string(),
+                r#type: "function".to_string(),
+                function: OpenAIFunctionCall {
+                    name: "ask_user_question".to_string(),
+                    arguments: r#"{"questions":[{"question":"Which host should I inspect?","options":["dev","prod"],"recommended_option_index":0}]}"#
+                        .to_string(),
+                },
+            },
+        ]);
+
+        let calls = calls
+            .into_warp_tool_calls()
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert!(matches!(
+            calls[0].tool.as_ref(),
+            Some(api::message::tool_call::Tool::ReadFiles(_))
+        ));
+        assert!(matches!(
+            calls[1].tool.as_ref(),
+            Some(api::message::tool_call::Tool::SearchCodebase(_))
+        ));
+        assert!(matches!(
+            calls[2].tool.as_ref(),
+            Some(api::message::tool_call::Tool::Grep(_))
+        ));
+        assert!(matches!(
+            calls[3].tool.as_ref(),
+            Some(api::message::tool_call::Tool::FileGlobV2(_))
+        ));
+        assert!(matches!(
+            calls[4].tool.as_ref(),
+            Some(api::message::tool_call::Tool::ReadSkill(_))
+        ));
+        assert!(matches!(
+            calls[5].tool.as_ref(),
+            Some(api::message::tool_call::Tool::AskUserQuestion(_))
         ));
     }
 
