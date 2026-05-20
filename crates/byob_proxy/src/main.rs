@@ -143,11 +143,8 @@ impl Config {
         if let Some(headers) = env_var_nonempty("BYOB_EXTRA_HEADERS_JSON") {
             extra_headers.extend(parse_extra_headers_json(&headers)?);
         }
-        let system_prompt = env::var("BYOB_SYSTEM_PROMPT").unwrap_or_else(|_| {
-            "You are an agent running inside Warp. Use concise terminal-aware answers. \
-             When an action is needed, call the provided tools instead of describing the action."
-                .to_string()
-        });
+        let system_prompt =
+            env::var("BYOB_SYSTEM_PROMPT").unwrap_or_else(|_| default_agent_system_prompt().into());
         let request_timeout = env::var("BYOB_REQUEST_TIMEOUT_SECS")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
@@ -173,6 +170,15 @@ fn default_extra_headers() -> BTreeMap<String, String> {
         ("client".to_string(), "codex-cli".to_string()),
         ("client-version".to_string(), "0".to_string()),
     ])
+}
+
+fn default_agent_system_prompt() -> &'static str {
+    "You are WarpOCA, an agent running inside the Warp terminal UI. \
+     Be concise, but behave like an active terminal operator: state what you are about to do, \
+     call tools for terminal work, observe the returned output, adapt, and finish with a clear conclusion. \
+     Do not emit only tool calls when a short user-facing status sentence would help. \
+     Never claim a command ran, a file changed, or a remote host state was verified until Warp returns the tool result. \
+     If a command is still running, monitor it with the long-running command tools and explain what you observe."
 }
 
 fn env_var_nonempty(name: &str) -> Option<String> {
@@ -2265,9 +2271,12 @@ fn selected_model(request: &api::Request) -> Option<String> {
 fn warp_tool_instructions() -> &'static str {
     "Tool mapping:\n\
      - Use run_shell_command for terminal commands. Prefer read-only commands unless mutation is required.\n\
+     - When run_shell_command returns a long-running snapshot, use read_shell_command_output with the returned command_id to monitor it. Use delay_seconds for periodic checks and wait_until_complete when you need the final result.\n\
+     - Use write_to_lrc only when a running command needs terminal input. Use transfer_shell_command_control when the command requires secret, interactive, or human-only input.\n\
      - Use apply_file_diffs for file edits. Prefer v4a_updates when possible; otherwise use exact search/replace diffs.\n\
      - Use suggest_prompt for passive prompt chips or inline query banners when Warp asks for passive suggestions.\n\
      - Use suggest_rule only for durable rules the user may want to save for future agent runs.\n\
+     - For SSH checks, prefer absolute key paths when the working directory is known, IdentitiesOnly=yes, BatchMode=yes, StrictHostKeyChecking=accept-new, and a short ConnectTimeout. If SSH says to log in as another user, retry once with that user and summarize both attempts.\n\
      - Do not claim a command ran or a file changed until Warp returns the tool result."
 }
 
@@ -2289,6 +2298,85 @@ fn build_tool_definitions(request: &api::Request) -> Vec<OpenAITool> {
                         "uses_pager": { "type": "boolean", "default": false },
                         "is_risky": { "type": "boolean", "default": false },
                         "wait_until_complete": { "type": "boolean", "default": true }
+                    }
+                }),
+            },
+        });
+    }
+    if supports_tool(request, api::ToolType::ReadShellCommandOutput) {
+        tools.push(OpenAITool {
+            r#type: "function",
+            function: OpenAIFunctionDefinition {
+                name: "read_shell_command_output",
+                description: "Read output from a long-running shell command that Warp is monitoring.",
+                parameters: json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["command_id"],
+                    "properties": {
+                        "command_id": {
+                            "type": "string",
+                            "description": "The command_id returned by a long-running command snapshot."
+                        },
+                        "delay_seconds": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "Optional delay before reading another snapshot."
+                        },
+                        "wait_until_complete": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "Wait for command completion instead of taking a timed snapshot."
+                        }
+                    }
+                }),
+            },
+        });
+    }
+    if supports_tool(request, api::ToolType::WriteToLongRunningShellCommand) {
+        tools.push(OpenAITool {
+            r#type: "function",
+            function: OpenAIFunctionDefinition {
+                name: "write_to_lrc",
+                description: "Write input to a long-running foreground command in Warp's terminal.",
+                parameters: json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["command_id", "input"],
+                    "properties": {
+                        "command_id": {
+                            "type": "string",
+                            "description": "The command_id returned by a long-running command snapshot."
+                        },
+                        "input": {
+                            "type": "string",
+                            "description": "The exact text or bytes to send to the terminal command."
+                        },
+                        "mode": {
+                            "type": "string",
+                            "enum": ["raw", "line", "block"],
+                            "default": "raw"
+                        }
+                    }
+                }),
+            },
+        });
+    }
+    if supports_tool(request, api::ToolType::TransferShellCommandControlToUser) {
+        tools.push(OpenAITool {
+            r#type: "function",
+            function: OpenAIFunctionDefinition {
+                name: "transfer_shell_command_control",
+                description: "Transfer control of a running terminal command back to the user.",
+                parameters: json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["reason"],
+                    "properties": {
+                        "reason": {
+                            "type": "string",
+                            "description": "A concise explanation of why the user must take over."
+                        }
                     }
                 }),
             },
@@ -2826,7 +2914,31 @@ fn warp_tool_call_to_openai(tool_call: &api::message::ToolCall) -> Option<OpenAI
                 "is_read_only": command.is_read_only,
                 "uses_pager": command.uses_pager,
                 "is_risky": command.is_risky,
-                "wait_until_complete": true,
+                "wait_until_complete": command.wait_until_complete_value.as_ref().is_none_or(
+                    |api::message::tool_call::run_shell_command::WaitUntilCompleteValue::WaitUntilComplete(value)| *value
+                ),
+            }),
+        ),
+        api::message::tool_call::Tool::ReadShellCommandOutput(command) => (
+            "read_shell_command_output",
+            json!({
+                "command_id": command.command_id,
+                "delay_seconds": read_shell_delay_seconds(command),
+                "wait_until_complete": read_shell_waits_until_complete(command),
+            }),
+        ),
+        api::message::tool_call::Tool::WriteToLongRunningShellCommand(command) => (
+            "write_to_lrc",
+            json!({
+                "command_id": command.command_id,
+                "input": String::from_utf8_lossy(&command.input).to_string(),
+                "mode": write_to_lrc_mode_name(command),
+            }),
+        ),
+        api::message::tool_call::Tool::TransferShellCommandControlToUser(transfer) => (
+            "transfer_shell_command_control",
+            json!({
+                "reason": transfer.reason,
             }),
         ),
         api::message::tool_call::Tool::ApplyFileDiffs(diffs) => (
@@ -2860,10 +2972,51 @@ fn warp_tool_call_to_openai(tool_call: &api::message::ToolCall) -> Option<OpenAI
     })
 }
 
+fn read_shell_delay_seconds(
+    command: &api::message::tool_call::ReadShellCommandOutput,
+) -> Option<i64> {
+    match &command.delay {
+        Some(api::message::tool_call::read_shell_command_output::Delay::Duration(duration)) => {
+            Some(duration.seconds)
+        }
+        _ => None,
+    }
+}
+
+fn read_shell_waits_until_complete(
+    command: &api::message::tool_call::ReadShellCommandOutput,
+) -> bool {
+    matches!(
+        command.delay,
+        Some(api::message::tool_call::read_shell_command_output::Delay::OnCompletion(_))
+    )
+}
+
+fn write_to_lrc_mode_name(
+    command: &api::message::tool_call::WriteToLongRunningShellCommand,
+) -> &'static str {
+    use api::message::tool_call::write_to_long_running_shell_command::mode::Mode;
+
+    match command.mode.as_ref().and_then(|mode| mode.mode.as_ref()) {
+        Some(Mode::Line(_)) => "line",
+        Some(Mode::Block(_)) => "block",
+        Some(Mode::Raw(_)) | None => "raw",
+    }
+}
+
 fn format_tool_call_result(result: &api::message::ToolCallResult) -> String {
     match &result.result {
         Some(api::message::tool_call_result::Result::RunShellCommand(result)) => {
             format_run_shell_result(result)
+        }
+        Some(api::message::tool_call_result::Result::ReadShellCommandOutput(result)) => {
+            format_read_shell_output_result(result)
+        }
+        Some(api::message::tool_call_result::Result::WriteToLongRunningShellCommand(result)) => {
+            format_write_to_lrc_result(result)
+        }
+        Some(api::message::tool_call_result::Result::TransferShellCommandControlToUser(result)) => {
+            format_transfer_shell_control_result(result)
         }
         Some(api::message::tool_call_result::Result::ApplyFileDiffs(result)) => {
             format_apply_file_diffs_result(result)
@@ -2878,6 +3031,15 @@ fn format_request_tool_call_result(result: &api::request::input::ToolCallResult)
         Some(api::request::input::tool_call_result::Result::RunShellCommand(result)) => {
             format_run_shell_result(result)
         }
+        Some(api::request::input::tool_call_result::Result::ReadShellCommandOutput(result)) => {
+            format_read_shell_output_result(result)
+        }
+        Some(api::request::input::tool_call_result::Result::WriteToLongRunningShellCommand(
+            result,
+        )) => format_write_to_lrc_result(result),
+        Some(api::request::input::tool_call_result::Result::TransferShellCommandControlToUser(
+            result,
+        )) => format_transfer_shell_control_result(result),
         Some(api::request::input::tool_call_result::Result::ApplyFileDiffs(result)) => {
             format_apply_file_diffs_result(result)
         }
@@ -2898,10 +3060,9 @@ fn format_run_shell_result(result: &api::RunShellCommandResult) -> String {
         ),
         Some(api::run_shell_command_result::Result::LongRunningCommandSnapshot(snapshot)) => {
             format!(
-                "command: {}\ncommand_id: {}\nlong-running output:\n{}",
+                "command: {}\n{}",
                 result.command,
-                snapshot.command_id,
-                truncate(&snapshot.output, 12000)
+                format_long_running_snapshot(snapshot)
             )
         }
         Some(api::run_shell_command_result::Result::PermissionDenied(_)) => {
@@ -2914,6 +3075,93 @@ fn format_run_shell_result(result: &api::RunShellCommandResult) -> String {
             truncate(&result.output, 12000)
         ),
     }
+}
+
+fn format_read_shell_output_result(result: &api::ReadShellCommandOutputResult) -> String {
+    match &result.result {
+        Some(api::read_shell_command_output_result::Result::CommandFinished(finished)) => {
+            format_shell_finished(Some(&result.command), finished)
+        }
+        Some(api::read_shell_command_output_result::Result::LongRunningCommandSnapshot(
+            snapshot,
+        )) => {
+            format!(
+                "command: {}\n{}",
+                result.command,
+                format_long_running_snapshot(snapshot)
+            )
+        }
+        Some(api::read_shell_command_output_result::Result::Error(error)) => {
+            format_shell_error("read_shell_command_output", error)
+        }
+        None => format!(
+            "command: {}\nread_shell_command_output returned no result.",
+            result.command
+        ),
+    }
+}
+
+fn format_write_to_lrc_result(result: &api::WriteToLongRunningShellCommandResult) -> String {
+    match &result.result {
+        Some(api::write_to_long_running_shell_command_result::Result::CommandFinished(
+            finished,
+        )) => format_shell_finished(None, finished),
+        Some(
+            api::write_to_long_running_shell_command_result::Result::LongRunningCommandSnapshot(
+                snapshot,
+            ),
+        ) => format_long_running_snapshot(snapshot),
+        Some(api::write_to_long_running_shell_command_result::Result::Error(error)) => {
+            format_shell_error("write_to_lrc", error)
+        }
+        None => "write_to_lrc returned no result.".to_string(),
+    }
+}
+
+fn format_transfer_shell_control_result(
+    result: &api::TransferShellCommandControlToUserResult,
+) -> String {
+    match &result.result {
+        Some(api::transfer_shell_command_control_to_user_result::Result::CommandFinished(
+            finished,
+        )) => format_shell_finished(None, finished),
+        Some(
+            api::transfer_shell_command_control_to_user_result::Result::LongRunningCommandSnapshot(
+                snapshot,
+            ),
+        ) => format_long_running_snapshot(snapshot),
+        Some(api::transfer_shell_command_control_to_user_result::Result::Error(error)) => {
+            format_shell_error("transfer_shell_command_control", error)
+        }
+        None => "transfer_shell_command_control returned no result.".to_string(),
+    }
+}
+
+fn format_shell_finished(command: Option<&str>, finished: &api::ShellCommandFinished) -> String {
+    let command = command
+        .filter(|command| !command.is_empty())
+        .map(|command| format!("command: {command}\n"))
+        .unwrap_or_default();
+    format!(
+        "{command}command_id: {}\nexit_code: {}\noutput:\n{}",
+        finished.command_id,
+        finished.exit_code,
+        truncate(&finished.output, 12000)
+    )
+}
+
+fn format_long_running_snapshot(snapshot: &api::LongRunningShellCommandSnapshot) -> String {
+    format!(
+        "command_id: {}\nstatus: still running\nalt_screen: {}\npreempted: {}\noutput:\n{}",
+        snapshot.command_id,
+        snapshot.is_alt_screen_active,
+        snapshot.is_preempted,
+        truncate(&snapshot.output, 12000)
+    )
+}
+
+fn format_shell_error(tool_name: &str, error: &api::ShellCommandError) -> String {
+    format!("{tool_name} failed: {error:?}")
 }
 
 fn format_apply_file_diffs_result(result: &api::ApplyFileDiffsResult) -> String {
@@ -3388,6 +3636,34 @@ impl ToolCallAccumulator {
                     },
                 )
             }
+            "read_shell_command_output" => {
+                let args: ReadShellCommandOutputArgs = serde_json::from_str(&self.arguments)?;
+                api::message::tool_call::Tool::ReadShellCommandOutput(
+                    api::message::tool_call::ReadShellCommandOutput {
+                        delay: args.to_delay(),
+                        command_id: args.command_id,
+                    },
+                )
+            }
+            "write_to_lrc" | "write_to_long_running_shell_command" => {
+                let args: WriteToLongRunningShellCommandArgs =
+                    serde_json::from_str(&self.arguments)?;
+                api::message::tool_call::Tool::WriteToLongRunningShellCommand(
+                    api::message::tool_call::WriteToLongRunningShellCommand {
+                        mode: Some(args.to_mode()),
+                        input: args.input.into_bytes(),
+                        command_id: args.command_id,
+                    },
+                )
+            }
+            "transfer_shell_command_control" | "transfer_shell_command_control_to_user" => {
+                let args: TransferShellCommandControlArgs = serde_json::from_str(&self.arguments)?;
+                api::message::tool_call::Tool::TransferShellCommandControlToUser(
+                    api::message::tool_call::TransferShellCommandControlToUser {
+                        reason: args.reason,
+                    },
+                )
+            }
             "apply_file_diffs" => {
                 let args: ApplyFileDiffsArgs = serde_json::from_str(&self.arguments)?;
                 api::message::tool_call::Tool::ApplyFileDiffs(
@@ -3481,6 +3757,65 @@ struct RunShellCommandArgs {
     #[serde(default)]
     is_risky: bool,
     wait_until_complete: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReadShellCommandOutputArgs {
+    command_id: String,
+    delay_seconds: Option<i64>,
+    #[serde(default)]
+    wait_until_complete: bool,
+}
+
+impl ReadShellCommandOutputArgs {
+    fn to_delay(&self) -> Option<api::message::tool_call::read_shell_command_output::Delay> {
+        if self.wait_until_complete {
+            return Some(
+                api::message::tool_call::read_shell_command_output::Delay::OnCompletion(()),
+            );
+        }
+
+        self.delay_seconds.map(|seconds| {
+            api::message::tool_call::read_shell_command_output::Delay::Duration(
+                prost_types::Duration {
+                    seconds: seconds.max(0),
+                    nanos: 0,
+                },
+            )
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct WriteToLongRunningShellCommandArgs {
+    command_id: String,
+    input: String,
+    mode: Option<String>,
+}
+
+impl WriteToLongRunningShellCommandArgs {
+    fn to_mode(&self) -> api::message::tool_call::write_to_long_running_shell_command::Mode {
+        use api::message::tool_call::write_to_long_running_shell_command::mode::Mode;
+
+        let mode = match self
+            .mode
+            .as_deref()
+            .unwrap_or("raw")
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "line" => Mode::Line(()),
+            "block" => Mode::Block(()),
+            _ => Mode::Raw(()),
+        };
+
+        api::message::tool_call::write_to_long_running_shell_command::Mode { mode: Some(mode) }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct TransferShellCommandControlArgs {
+    reason: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -3724,6 +4059,41 @@ mod tests {
     }
 
     #[test]
+    fn default_prompt_describes_agentic_terminal_loop() {
+        let prompt = default_agent_system_prompt();
+
+        assert!(prompt.contains("state what you are about to do"));
+        assert!(prompt.contains("monitor it with the long-running command tools"));
+    }
+
+    #[test]
+    fn exposes_long_running_terminal_tools() {
+        let request = api::Request {
+            settings: Some(api::request::Settings {
+                supported_tools: vec![
+                    api::ToolType::RunShellCommand as i32,
+                    api::ToolType::ReadShellCommandOutput as i32,
+                    api::ToolType::WriteToLongRunningShellCommand as i32,
+                    api::ToolType::TransferShellCommandControlToUser as i32,
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let tools = build_tool_definitions(&request);
+        let names = tools
+            .iter()
+            .map(|tool| tool.function.name)
+            .collect::<BTreeSet<_>>();
+
+        assert!(names.contains("run_shell_command"));
+        assert!(names.contains("read_shell_command_output"));
+        assert!(names.contains("write_to_lrc"));
+        assert!(names.contains("transfer_shell_command_control"));
+    }
+
+    #[test]
     fn encodes_warp_sse_data_as_decodable_response_event() {
         let event = finished_event_done();
         let encoded = BASE64_URL_SAFE.encode(event.encode_to_vec());
@@ -3816,6 +4186,56 @@ mod tests {
         assert!(matches!(
             call.tool,
             Some(api::message::tool_call::Tool::RunShellCommand(_))
+        ));
+    }
+
+    #[test]
+    fn accumulates_long_running_terminal_tool_calls() {
+        let mut calls = ToolCallAccumulatorSet::default();
+        calls.apply_full_calls(vec![
+            OpenAIMessageToolCall {
+                id: "call_read".to_string(),
+                r#type: "function".to_string(),
+                function: OpenAIFunctionCall {
+                    name: "read_shell_command_output".to_string(),
+                    arguments: r#"{"command_id":"block_1","delay_seconds":1}"#.to_string(),
+                },
+            },
+            OpenAIMessageToolCall {
+                id: "call_write".to_string(),
+                r#type: "function".to_string(),
+                function: OpenAIFunctionCall {
+                    name: "write_to_lrc".to_string(),
+                    arguments: r#"{"command_id":"block_1","input":"y\n","mode":"raw"}"#.to_string(),
+                },
+            },
+            OpenAIMessageToolCall {
+                id: "call_transfer".to_string(),
+                r#type: "function".to_string(),
+                function: OpenAIFunctionCall {
+                    name: "transfer_shell_command_control".to_string(),
+                    arguments: r#"{"reason":"Password prompt requires the user."}"#.to_string(),
+                },
+            },
+        ]);
+
+        let calls = calls
+            .into_warp_tool_calls()
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert!(matches!(
+            calls[0].tool.as_ref(),
+            Some(api::message::tool_call::Tool::ReadShellCommandOutput(_))
+        ));
+        assert!(matches!(
+            calls[1].tool.as_ref(),
+            Some(api::message::tool_call::Tool::WriteToLongRunningShellCommand(_))
+        ));
+        assert!(matches!(
+            calls[2].tool.as_ref(),
+            Some(api::message::tool_call::Tool::TransferShellCommandControlToUser(_))
         ));
     }
 
