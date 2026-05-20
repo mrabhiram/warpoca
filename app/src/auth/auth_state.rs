@@ -108,6 +108,15 @@ impl AuthState {
     pub fn initialize(ctx: &AppContext, api_key: Option<String>) -> Self {
         let state = Self::new(ctx);
 
+        if std::env::var("WARP_ENABLE_CLOUD_AUTH").as_deref() != Ok("1") {
+            // BYOB builds are intentionally self-hosted and do not authenticate against Warp's
+            // cloud. Start as a local, onboarded user so the native terminal UI is available
+            // without opening the Warp sign-in flow.
+            state.set_user(Some(User::test()));
+            state.set_credentials(Some(Credentials::Bearer("byob-local-auth".to_string())));
+            return state;
+        }
+
         if Self::should_use_test_user() {
             state.set_user(Some(User::test()));
             #[cfg(any(test, feature = "integration_tests", feature = "skip_login"))]

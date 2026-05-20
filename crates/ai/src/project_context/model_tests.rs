@@ -344,6 +344,34 @@ fn test_global_rule_alone_no_project_rules() {
 }
 
 #[test]
+fn test_global_rule_contains_finds_local_rule_markers() {
+    let mut model = ProjectContextModel::default();
+    insert_global_rule(
+        &mut model,
+        Path::new("/home/u/Library/Application Support/WarpOCA/rules/rule.md"),
+        "<!-- warpoca-suggested-logging-id: rule_1 -->\nUse OKE.",
+    );
+
+    assert!(model.global_rule_contains("warpoca-suggested-logging-id: rule_1"));
+    assert!(!model.global_rule_contains("warpoca-suggested-logging-id: missing"));
+}
+
+#[cfg(feature = "local_fs")]
+#[test]
+fn test_format_local_rule_markdown_includes_suggested_marker() {
+    let markdown = format_local_rule_markdown(
+        Some("Use OKE"),
+        "Prefer OKE for Kubernetes examples.",
+        Some("rule_1"),
+    );
+
+    assert!(markdown.contains("warpoca-local-rule: true"));
+    assert!(markdown.contains("warpoca-suggested-logging-id: rule_1"));
+    assert!(markdown.contains("# Use OKE"));
+    assert!(markdown.contains("Prefer OKE for Kubernetes examples."));
+}
+
+#[test]
 fn test_global_rule_layered_with_project_warp() {
     let mut model = ProjectContextModel::default();
     insert_global_rule(&mut model, Path::new("/home/u/.agents/AGENTS.md"), "global");

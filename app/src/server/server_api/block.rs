@@ -145,6 +145,25 @@ impl BlockClient for ServerApi {
         &self,
         request: GenerateBlockTitleRequest,
     ) -> Result<GenerateBlockTitleResponse, anyhow::Error> {
+        if std::env::var("WARP_ENABLE_CLOUD_AI").ok().as_deref() != Some("1") {
+            let custom_proxy_url = std::env::var("WARP_CUSTOM_AI_PROXY")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "http://127.0.0.1:1337".to_string());
+            let custom_proxy_url = custom_proxy_url.trim().trim_end_matches('/');
+            let response = self
+                .client
+                .post(format!("{custom_proxy_url}/ai/generate_block_title"))
+                .json(&request)
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            return Ok(response);
+        }
+
         let auth_token = self.get_or_refresh_access_token().await?;
         let request_builder = self.client.post(format!(
             "{}/ai/generate_block_title",

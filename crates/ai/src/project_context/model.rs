@@ -73,6 +73,56 @@ fn matches_rules_pattern(file_name_str: &str) -> bool {
     false
 }
 
+#[cfg(feature = "local_fs")]
+fn local_rule_file_name(name: Option<&str>, content: &str) -> String {
+    let seed = name
+        .filter(|name| !name.trim().is_empty())
+        .or_else(|| content.lines().map(str::trim).find(|line| !line.is_empty()))
+        .unwrap_or("rule");
+    let mut stem = seed
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    while stem.contains("--") {
+        stem = stem.replace("--", "-");
+    }
+    stem = stem.trim_matches('-').chars().take(48).collect();
+    if stem.is_empty() {
+        stem = "rule".to_string();
+    }
+    format!("{stem}-{}.md", uuid::Uuid::new_v4().simple())
+}
+
+#[cfg(feature = "local_fs")]
+fn format_local_rule_markdown(
+    name: Option<&str>,
+    content: &str,
+    suggested_logging_id: Option<&str>,
+) -> String {
+    let mut output = String::from("<!-- warpoca-local-rule: true -->\n");
+    if let Some(logging_id) = suggested_logging_id.filter(|id| !id.trim().is_empty()) {
+        output.push_str("<!-- warpoca-suggested-logging-id: ");
+        output.push_str(&logging_id.replace("--", "- -"));
+        output.push_str(" -->\n");
+    }
+    if let Some(name) = name.filter(|name| !name.trim().is_empty()) {
+        output.push_str("\n# ");
+        output.push_str(name.trim());
+        output.push_str("\n\n");
+    } else {
+        output.push('\n');
+    }
+    output.push_str(content.trim());
+    output.push('\n');
+    output
+}
+
 #[derive(Debug, Default, Clone)]
 struct ProjectRules {
     rules: Vec<RuleAtPath>,
@@ -493,6 +543,72 @@ impl ProjectContextModel {
     /// `global_rules`.
     pub fn index_global_rules(&mut self, ctx: &mut ModelContext<Self>) {
         self.global_rules.index(ctx);
+    }
+
+    pub fn create_local_global_rule(
+        &mut self,
+        name: Option<String>,
+        content: String,
+        suggested_logging_id: Option<String>,
+        ctx: &mut ModelContext<Self>,
+    ) -> Result<()> {
+        #[cfg(feature = "local_fs")]
+        {
+            let Some(home_dir) = dirs::home_dir() else {
+                anyhow::bail!("Home directory not found; cannot create local WarpOCA rule");
+            };
+            let rules_dir = super::global_rules::warpoca_rules_dir(&home_dir);
+            let file_name = local_rule_file_name(name.as_deref(), &content);
+            let file_path = rules_dir.join(file_name);
+            let file_content = format_local_rule_markdown(
+                name.as_deref(),
+                &content,
+                suggested_logging_id.as_deref(),
+            );
+
+            ctx.spawn(
+                async move {
+                    async_fs::create_dir_all(&rules_dir).await?;
+                    async_fs::write(&file_path, &file_content).await?;
+                    anyhow::Ok((file_path, file_content))
+                },
+                |me, result, ctx| match result {
+                    Ok((file_path, file_content)) => {
+                        me.global_rules.rules.insert(
+                            file_path.clone(),
+                            ProjectRule {
+                                path: file_path.clone(),
+                                content: file_content,
+                            },
+                        );
+                        ctx.emit(ProjectContextModelEvent::GlobalRulesChanged(
+                            GlobalRulesDelta {
+                                discovered_rules: vec![file_path],
+                                deleted_rules: vec![],
+                            },
+                        ));
+                    }
+                    Err(err) => {
+                        log::warn!("Failed to create local WarpOCA rule: {err}");
+                    }
+                },
+            );
+        }
+
+        #[cfg(not(feature = "local_fs"))]
+        {
+            let _ = (name, content, suggested_logging_id, ctx);
+        }
+
+        Ok(())
+    }
+
+    pub fn global_rule_contains(&self, needle: &str) -> bool {
+        !needle.is_empty()
+            && self
+                .global_rules
+                .active_rules()
+                .any(|rule| rule.content.contains(needle))
     }
 
     /// Project-only rule lookup. Returns `Some` only when an indexed project

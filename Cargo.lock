@@ -2370,6 +2370,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5dd9dc738b7a8311c7ade152424974d8115f2cdad61e8dab8dac9f2362298510"
 
 [[package]]
+name = "byob_proxy"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "axum",
+ "base64 0.22.1",
+ "bytes",
+ "futures-util",
+ "http 1.4.0",
+ "prost 0.14.3",
+ "prost-types",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml_edit 0.25.6+spec-1.1.0",
+ "uuid",
+ "warp_multi_agent_api",
+]
+
+[[package]]
 name = "byte-unit"
 version = "5.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -3,6 +3,7 @@ pub mod auth;
 pub mod block;
 pub mod harness_support;
 pub mod integrations;
+mod local_object;
 pub mod managed_secrets;
 pub mod object;
 pub(crate) mod presigned_upload;
@@ -30,6 +31,7 @@ use base64::Engine;
 use block::BlockClient;
 use channel_versions::ChannelVersions;
 use futures::StreamExt;
+use local_object::LocalObjectClient;
 use object::ObjectClient;
 use prost::Message;
 use referral::ReferralsClient;
@@ -1062,6 +1064,26 @@ impl ServerApi {
         request: &GenerateAIInputSuggestionsRequest,
     ) -> Result<generate_ai_input_suggestions::GenerateAIInputSuggestionsResponseV2, AIApiError>
     {
+        if std::env::var("WARP_ENABLE_CLOUD_AI").ok().as_deref() != Some("1") {
+            let custom_proxy_url = std::env::var("WARP_CUSTOM_AI_PROXY")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "http://127.0.0.1:1337".to_string());
+            let custom_proxy_url = custom_proxy_url.trim().trim_end_matches('/');
+            let response = self
+                .client
+                .post(format!("{custom_proxy_url}/ai/generate_input_suggestions"))
+                .json(request)
+                .send()
+                .await?
+                .error_for_status_with_body()
+                .await?
+                .json()
+                .await?;
+            return Ok(response);
+        }
+
         let auth_token = self.get_or_refresh_access_token().await?;
 
         let request_builder = self.client.post(format!(
@@ -1087,6 +1109,26 @@ impl ServerApi {
         &self,
         request: &GetRelevantFiles,
     ) -> Result<GetRelevantFilesResponse, AIApiError> {
+        if std::env::var("WARP_ENABLE_CLOUD_AI").ok().as_deref() != Some("1") {
+            let custom_proxy_url = std::env::var("WARP_CUSTOM_AI_PROXY")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "http://127.0.0.1:1337".to_string());
+            let custom_proxy_url = custom_proxy_url.trim().trim_end_matches('/');
+            let response = self
+                .client
+                .post(format!("{custom_proxy_url}/ai/relevant_files"))
+                .json(request)
+                .send()
+                .await?
+                .error_for_status_with_body()
+                .await?
+                .json()
+                .await?;
+            return Ok(response);
+        }
+
         let auth_token = self.get_or_refresh_access_token().await?;
 
         let request_builder = self.client.post(format!(
@@ -1114,6 +1156,28 @@ impl ServerApi {
         &self,
         request: &GenerateAMQuerySuggestionsRequest,
     ) -> Result<generate_am_query_suggestions::GenerateAMQuerySuggestionsResponse, AIApiError> {
+        if std::env::var("WARP_ENABLE_CLOUD_AI").ok().as_deref() != Some("1") {
+            let custom_proxy_url = std::env::var("WARP_CUSTOM_AI_PROXY")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "http://127.0.0.1:1337".to_string());
+            let custom_proxy_url = custom_proxy_url.trim().trim_end_matches('/');
+            let response = self
+                .client
+                .post(format!(
+                    "{custom_proxy_url}/ai/generate_am_query_suggestions"
+                ))
+                .json(request)
+                .send()
+                .await?
+                .error_for_status_with_body()
+                .await?
+                .json()
+                .await?;
+            return Ok(response);
+        }
+
         let auth_token = self.get_or_refresh_access_token().await?;
 
         cfg_if::cfg_if! {
@@ -1150,6 +1214,26 @@ impl ServerApi {
         &self,
         request: &PredictAMQueriesRequest,
     ) -> Result<PredictAMQueriesResponse, AIApiError> {
+        if std::env::var("WARP_ENABLE_CLOUD_AI").ok().as_deref() != Some("1") {
+            let custom_proxy_url = std::env::var("WARP_CUSTOM_AI_PROXY")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "http://127.0.0.1:1337".to_string());
+            let custom_proxy_url = custom_proxy_url.trim().trim_end_matches('/');
+            let response = self
+                .client
+                .post(format!("{custom_proxy_url}/ai/predict_am_queries"))
+                .json(request)
+                .send()
+                .await?
+                .error_for_status_with_body()
+                .await?
+                .json()
+                .await?;
+            return Ok(response);
+        }
+
         let auth_token = self.get_or_refresh_access_token().await?;
         let request_builder = self.client.post(format!(
             "{}/ai/predict_am_queries",
@@ -1227,18 +1311,74 @@ impl ServerApi {
         request: &warp_multi_agent_api::Request,
     ) -> std::result::Result<AIOutputStream<warp_multi_agent_api::ResponseEvent>, Arc<AIApiError>>
     {
-        let auth_token = self
-            .get_or_refresh_access_token()
-            .await
-            .map_err(Into::into)
-            .map_err(Arc::new)?;
-
         let is_passive = request.input.as_ref().is_some_and(|input| {
             matches!(
                 input.r#type,
                 Some(warp_multi_agent_api::request::input::Type::GeneratePassiveSuggestions(_))
             )
         });
+
+        if std::env::var("WARP_ENABLE_CLOUD_AI").ok().as_deref() != Some("1") {
+            let custom_proxy_url = std::env::var("WARP_CUSTOM_AI_PROXY")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "http://127.0.0.1:1337".to_string());
+            let custom_proxy_url = custom_proxy_url.trim().trim_end_matches('/');
+            let url = format!(
+                "{}/{}",
+                custom_proxy_url,
+                if is_passive {
+                    "ai/passive-suggestions"
+                } else {
+                    "ai/multi-agent"
+                }
+            );
+            let request = self
+                .client
+                .post(url)
+                .proto(request)
+                .prevent_sleep("Agent Mode request in-progress");
+
+            let output_stream = request.eventsource().filter_map(|event| async {
+                let result = match event {
+                    Ok(reqwest_eventsource::Event::Message(message_event)) => {
+                        match BASE64_URL_SAFE.decode(message_event.data.trim_matches('"')) {
+                            Ok(decoded_data) => {
+                                let action = warp_multi_agent_api::ResponseEvent::decode(
+                                    decoded_data.as_slice(),
+                                );
+                                Some(action.map_err(|e| AIApiError::Other(anyhow::Error::from(e))))
+                            }
+                            Err(e) => Some(Err(AIApiError::Other(anyhow::Error::from(e)))),
+                        }
+                    }
+                    Ok(reqwest_eventsource::Event::Open) => None,
+                    Err(err) => Some(Err(AIApiError::from_stream_error(
+                        "GenerateMultiAgentOutput",
+                        err,
+                    )
+                    .await)),
+                }
+                .map(|item| item.map_err(Arc::new));
+                result
+            });
+
+            cfg_if::cfg_if! {
+                if #[cfg(target_family = "wasm")] {
+                    return Ok(output_stream.boxed_local());
+                } else {
+                    return Ok(output_stream.boxed());
+                }
+            }
+        }
+
+        let auth_token = self
+            .get_or_refresh_access_token()
+            .await
+            .map_err(Into::into)
+            .map_err(Arc::new)?;
+
         let is_evals = cfg!(feature = "agent_mode_evals");
         let url = format!(
             "{}/{}/{}",
@@ -1528,6 +1668,10 @@ impl ServerApiProvider {
     }
 
     pub fn get_cloud_objects_client(&self) -> Arc<dyn ObjectClient> {
+        if !cfg!(test) && std::env::var("WARP_ENABLE_CLOUD_AI").ok().as_deref() != Some("1") {
+            return Arc::new(LocalObjectClient::new());
+        }
+
         self.server_api.clone()
     }
 

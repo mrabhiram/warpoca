@@ -3,6 +3,7 @@ use async_channel::Sender;
 use repo_metadata::repository::{RepositorySubscriber, SubscriberId};
 use repo_metadata::{DirectoryWatcher, Repository, RepositoryUpdate};
 use std::collections::{BTreeMap, HashMap};
+use std::fs;
 use std::path::{Path, PathBuf};
 use strum::IntoEnumIterator;
 use strum_macros::EnumIter;
@@ -11,11 +12,15 @@ use warp_util::standardized_path::StandardizedPath;
 use warpui::{ModelContext, ModelHandle, SingletonEntity};
 use watcher::{HomeDirectoryWatcher, HomeDirectoryWatcherEvent};
 
-/// A well-known location under `$HOME` that may contain a global rule file.
+/// A well-known location that may contain a global rule file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter)]
 enum GlobalRuleSource {
     /// `~/.agents/AGENTS.md`.
     Agents,
+    /// WarpOCA's local rules directory.
+    WarpOcaRules,
+    /// WarpOCA's local knowledge directory.
+    WarpOcaKnowledge,
 }
 
 impl GlobalRuleSource {
@@ -23,22 +28,86 @@ impl GlobalRuleSource {
     fn name(self) -> &'static str {
         match self {
             Self::Agents => "agents",
+            Self::WarpOcaRules => "warpoca-rules",
+            Self::WarpOcaKnowledge => "warpoca-knowledge",
         }
     }
 
-    /// Subdirectory under `$HOME`, e.g. `".agents"`.
-    fn home_subdir(self) -> &'static str {
+    /// Directory watched for this source.
+    fn directory(self, home_dir: &Path) -> PathBuf {
         match self {
-            Self::Agents => ".agents",
+            Self::Agents => home_dir.join(".agents"),
+            Self::WarpOcaRules => warpoca_rules_dir(home_dir),
+            Self::WarpOcaKnowledge => warpoca_knowledge_dir(home_dir),
         }
     }
 
-    /// File name within the subdir, e.g. `"AGENTS.md"`.
-    fn file_pattern(self) -> &'static str {
+    fn should_create_dir(self) -> bool {
+        matches!(self, Self::WarpOcaRules | Self::WarpOcaKnowledge)
+    }
+
+    fn matches_path(self, path: &Path, source_dir: &Path) -> bool {
+        if path.parent() != Some(source_dir) {
+            return false;
+        }
+
         match self {
-            Self::Agents => "AGENTS.md",
+            Self::Agents => path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.eq_ignore_ascii_case("AGENTS.md")),
+            Self::WarpOcaRules | Self::WarpOcaKnowledge => path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("md")),
         }
     }
+
+    fn initial_rule_paths(self, source_dir: &Path) -> Vec<PathBuf> {
+        match self {
+            Self::Agents => vec![source_dir.join("AGENTS.md")],
+            Self::WarpOcaRules | Self::WarpOcaKnowledge => fs::read_dir(source_dir)
+                .ok()
+                .into_iter()
+                .flat_map(|entries| entries.filter_map(Result::ok))
+                .map(|entry| entry.path())
+                .filter(|path| self.matches_path(path, source_dir))
+                .collect(),
+        }
+    }
+}
+
+pub fn warpoca_app_support_dir(home_dir: &Path) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        return home_dir.join("Library/Application Support/WarpOCA");
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        return std::env::var_os("APPDATA")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home_dir.join("AppData").join("Roaming"))
+            .join("WarpOCA");
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        std::env::var_os("XDG_DATA_HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home_dir.join(".local").join("share"))
+            .join("WarpOCA")
+    }
+}
+
+pub fn warpoca_rules_dir(home_dir: &Path) -> PathBuf {
+    warpoca_app_support_dir(home_dir).join("rules")
+}
+
+pub fn warpoca_knowledge_dir(home_dir: &Path) -> PathBuf {
+    warpoca_app_support_dir(home_dir).join("knowledge")
 }
 
 #[derive(Debug)]
@@ -124,12 +193,27 @@ impl GlobalRules {
         });
 
         for source in GlobalRuleSource::iter() {
-            let subdir_path = home_dir.join(source.home_subdir());
-            let target_file = subdir_path.join(source.file_pattern());
+            let subdir_path = source.directory(&home_dir);
+            if source.should_create_dir() {
+                if let Err(err) = fs::create_dir_all(&subdir_path) {
+                    safe_warn!(
+                        safe: (
+                            "Failed to create {} directory for local global rules",
+                            source.name()
+                        ),
+                        full: (
+                            "Failed to create {} directory for local global rules: {err}",
+                            subdir_path.display()
+                        )
+                    );
+                }
+            }
 
-            // Initial async read; if the file doesn't exist yet, the watcher
-            // will pick it up on creation.
-            Self::spawn_global_rule_read(target_file, ctx);
+            // Initial async reads; if files don't exist yet, the watcher will
+            // pick them up on creation.
+            for target_file in source.initial_rule_paths(&subdir_path) {
+                Self::spawn_global_rule_read(target_file, ctx);
+            }
 
             if subdir_path.exists() {
                 self.register_global_source_watcher(source, &subdir_path, ctx);
@@ -291,28 +375,36 @@ impl GlobalRules {
         let Some(home_dir) = dirs::home_dir() else {
             return;
         };
-        let target_file = home_dir
-            .join(source.home_subdir())
-            .join(source.file_pattern());
+        let source_dir = source.directory(&home_dir);
 
-        let was_deleted = update.deleted.iter().any(|f| f.path == target_file)
-            || update.moved.values().any(|f| f.path == target_file);
-        let was_added_or_modified = update.added_or_modified().any(|f| f.path == target_file)
-            || update.moved.keys().any(|f| f.path == target_file);
-
-        // If the file was deleted, remove it from the cached content and emit a change event.
-        if was_deleted && self.rules.remove(&target_file).is_some() {
-            ctx.emit(ProjectContextModelEvent::GlobalRulesChanged(
-                GlobalRulesDelta {
-                    discovered_rules: vec![],
-                    deleted_rules: vec![target_file.clone()],
-                },
-            ));
+        for deleted_file in update
+            .deleted
+            .iter()
+            .map(|file| &file.path)
+            .chain(update.moved.values().map(|file| &file.path))
+            .filter(|path| source.matches_path(path, &source_dir))
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            if self.rules.remove(&deleted_file).is_some() {
+                ctx.emit(ProjectContextModelEvent::GlobalRulesChanged(
+                    GlobalRulesDelta {
+                        discovered_rules: vec![],
+                        deleted_rules: vec![deleted_file],
+                    },
+                ));
+            }
         }
 
-        // If the file was added or modified, spawn a read to update the cached content.
-        if was_added_or_modified {
-            Self::spawn_global_rule_read(target_file, ctx);
+        for updated_file in update
+            .added_or_modified()
+            .map(|file| &file.path)
+            .chain(update.moved.keys().map(|file| &file.path))
+            .filter(|path| source.matches_path(path, &source_dir))
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            Self::spawn_global_rule_read(updated_file, ctx);
         }
     }
 
@@ -329,7 +421,7 @@ impl GlobalRules {
         };
 
         for source in GlobalRuleSource::iter() {
-            let subdir_path = home_dir.join(source.home_subdir());
+            let subdir_path = source.directory(&home_dir);
 
             let subdir_deleted = fs_event.deleted.contains(&subdir_path)
                 || fs_event.moved.values().any(|v| v == &subdir_path);
@@ -339,12 +431,20 @@ impl GlobalRules {
                         repo.stop_watching(state.subscriber_id, ctx);
                     });
                 }
-                let target_file = subdir_path.join(source.file_pattern());
-                if self.rules.remove(&target_file).is_some() {
+                let deleted_rules = self
+                    .rules
+                    .keys()
+                    .filter(|path| source.matches_path(path, &subdir_path))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for target_file in &deleted_rules {
+                    self.rules.remove(target_file);
+                }
+                if !deleted_rules.is_empty() {
                     ctx.emit(ProjectContextModelEvent::GlobalRulesChanged(
                         GlobalRulesDelta {
                             discovered_rules: vec![],
-                            deleted_rules: vec![target_file],
+                            deleted_rules,
                         },
                     ));
                 }
@@ -353,9 +453,10 @@ impl GlobalRules {
             let subdir_added =
                 fs_event.added.contains(&subdir_path) || fs_event.moved.contains_key(&subdir_path);
             if subdir_added {
-                let target_file = subdir_path.join(source.file_pattern());
                 // Kick off the read first, then register the watcher for subsequent edits.
-                Self::spawn_global_rule_read(target_file, ctx);
+                for target_file in source.initial_rule_paths(&subdir_path) {
+                    Self::spawn_global_rule_read(target_file, ctx);
+                }
                 self.register_global_source_watcher(source, &subdir_path, ctx);
             }
         }

@@ -3152,6 +3152,7 @@ impl UpdateManager {
         );
     }
 
+    #[allow(dead_code)]
     pub fn create_ai_fact(
         &mut self,
         ai_fact: AIFact,

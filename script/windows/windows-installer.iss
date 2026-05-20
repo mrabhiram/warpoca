@@ -19,6 +19,9 @@
 #ifndef TargetProfileDir
   #define TargetProfileDir "target\release-lto-debug_assertions"
 #endif
+#ifndef IconChannel
+  #define IconChannel ReleaseChannel
+#endif
 #define AssetsDir "..\..\app\assets\windows"
 
 // The mutex name must match what the Rust app creates in single_instance_manager.rs:
@@ -28,8 +31,9 @@
   ((ReleaseChannel == "preview") ? "Preview" : \
   ((ReleaseChannel == "local") ? "Local" : \
   ((ReleaseChannel == "integration") ? "Integration" : \
+  ((ReleaseChannel == "warpoca") ? "Oss" : \
   ((ReleaseChannel == "oss") ? "Oss" : \
-  "Unknown")))))
+  "Unknown"))))))
 #define AppMutexName "Local\Warp" + ChannelPascalCase + "_SingleInstance"
 
 
@@ -59,7 +63,7 @@ SolidCompression=yes
 WizardStyle=modern
 WizardSmallImageFile="installer-images\warp-logo.bmp"
 WizardImageFile="installer-images\warp-banner.bmp"
-SetupIconFile="..\..\app\channels\{#ReleaseChannel}\icon\no-padding\icon.ico"
+SetupIconFile="..\..\app\channels\{#IconChannel}\icon\no-padding\icon.ico"
 UninstallDisplayIcon="{app}\icon.ico"
 ; Force close previous Warp if it hasn't shut down yet.
 ; In the update flow we already warn the user if they have something running and make them confirm
@@ -96,9 +100,10 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 [Files]
 ; NOTE: Don't use "Flags: ignoreversion" on any shared system files
 Source: "{#TargetProfileDir}\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#TargetProfileDir}\byob_proxy.exe"; DestDir: "{app}\Helpers"; Flags: ignoreversion
 Source: "{#AssetsDir}\{#Arch}\conpty.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#AssetsDir}\{#Arch}\OpenConsole.exe"; DestDir: "{app}\{#Arch}"; Flags: ignoreversion
-Source: "..\..\app\channels\{#ReleaseChannel}\icon\no-padding\icon.ico"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\..\app\channels\{#IconChannel}\icon\no-padding\icon.ico"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#AssetsDir}\{#Arch}\vcruntime140.dll"; DestDir: "{app}"
 Source: "{#AssetsDir}\{#Arch}\vcruntime140_1.dll"; DestDir: "{app}"
 Source: "{#AssetsDir}\{#Arch}\msvcp140.dll"; DestDir: "{app}"
@@ -244,6 +249,8 @@ begin
       `Channel::cli_command_name` in the Rust source. }
 #if ReleaseChannel == "stable"
     CmdScriptName := 'oz.cmd'
+#elif ReleaseChannel == "warpoca"
+    CmdScriptName := 'warpoca.cmd';
 #elif ReleaseChannel == "oss"
     CmdScriptName := 'warp-oss.cmd';
 #else

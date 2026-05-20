@@ -9,13 +9,8 @@ use warp_core::user_preferences::GetUserPreferences;
 use warpui::{AppContext, Entity, EntityId, ModelContext, SingletonEntity};
 
 use crate::{
-    auth::{
-        auth_manager::{AuthManager, AuthManagerEvent},
-        AuthStateProvider,
-    },
+    auth::auth_manager::{AuthManager, AuthManagerEvent},
     network::{NetworkStatus, NetworkStatusEvent, NetworkStatusKind},
-    report_error,
-    server::server_api::ServerApiProvider,
     workspaces::user_workspaces::{UserWorkspaces, UserWorkspacesEvent},
 };
 
@@ -122,6 +117,9 @@ impl LLMProvider {
         }
     }
 }
+
+const BYOB_DEFAULT_MODEL_ID: &str = "gpt-5.5";
+const BYOB_CLI_AGENT_MODEL_ID: &str = "gpt-5.5";
 
 /// The host where an LLM can be routed to.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -533,6 +531,126 @@ impl Default for ModelsByFeature {
     }
 }
 
+fn byob_models_by_feature() -> ModelsByFeature {
+    let agent_choices = byob_model_choices();
+    let coding_choices = byob_model_choices();
+    let cli_agent_choices = byob_model_choices();
+
+    ModelsByFeature {
+        agent_mode: byob_available_llms(BYOB_DEFAULT_MODEL_ID, agent_choices),
+        coding: byob_available_llms(BYOB_DEFAULT_MODEL_ID, coding_choices),
+        cli_agent: Some(byob_available_llms(
+            BYOB_CLI_AGENT_MODEL_ID,
+            cli_agent_choices,
+        )),
+        computer_use: Some(default_computer_use_llms()),
+    }
+}
+
+fn byob_available_llms(default_id: &str, choices: Vec<LLMInfo>) -> AvailableLLMs {
+    AvailableLLMs {
+        default_id: default_id.to_owned().into(),
+        choices,
+        preferred_codex_model_id: Some(BYOB_DEFAULT_MODEL_ID.to_owned().into()),
+    }
+}
+
+fn byob_model_choices() -> Vec<LLMInfo> {
+    let mut choices = vec![
+        byob_llm_info(
+            "gpt-5.5",
+            "Codex Enterprise (gpt-5.5)",
+            Some("Oracle Code Assist"),
+            LLMProvider::OpenAI,
+            true,
+        ),
+        byob_llm_info(
+            "gpt-5.4",
+            "Codex Enterprise (gpt-5.4)",
+            Some("OpenAI-compatible endpoint"),
+            LLMProvider::OpenAI,
+            true,
+        ),
+        byob_llm_info(
+            "gpt-5.3-codex",
+            "Codex Enterprise (gpt-5.3-codex)",
+            Some("Coding optimized"),
+            LLMProvider::OpenAI,
+            true,
+        ),
+    ];
+
+    if let Ok(extra_models) = std::env::var("WARP_BYOB_MODELS") {
+        choices.extend(extra_models.split(',').filter_map(|entry| {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                return None;
+            }
+            let (id, display_name) = entry
+                .split_once(':')
+                .map(|(id, name)| (id.trim(), name.trim()))
+                .unwrap_or((entry, entry));
+            (!id.is_empty()).then(|| {
+                byob_llm_info(
+                    id,
+                    if display_name.is_empty() {
+                        id
+                    } else {
+                        display_name
+                    },
+                    Some("BYOB route"),
+                    LLMProvider::Unknown,
+                    true,
+                )
+            })
+        }));
+    }
+
+    choices
+}
+
+fn byob_llm_info(
+    id: &str,
+    display_name: &str,
+    description: Option<&str>,
+    provider: LLMProvider,
+    vision_supported: bool,
+) -> LLMInfo {
+    LLMInfo {
+        display_name: display_name.to_string(),
+        base_model_name: display_name.to_string(),
+        id: id.to_string().into(),
+        reasoning_level: None,
+        usage_metadata: LLMUsageMetadata {
+            request_multiplier: 1,
+            credit_multiplier: None,
+        },
+        description: description.map(ToOwned::to_owned),
+        disable_reason: None,
+        vision_supported,
+        spec: Some(LLMSpec {
+            cost: 0.0,
+            quality: 1.0,
+            speed: 1.0,
+        }),
+        provider,
+        host_configs: HashMap::from([(
+            LLMModelHost::DirectApi,
+            RoutingHostConfig {
+                enabled: true,
+                model_routing_host: LLMModelHost::DirectApi,
+            },
+        )]),
+        discount_percentage: None,
+        context_window: LLMContextWindow {
+            is_configurable: true,
+            min: 4096,
+            max: 1_048_576,
+            default_max: 262_144,
+        },
+    }
+}
+
 enum UpdatePopupVisibilityState {
     WaitingToBeShown,
     Visible(EntityId),
@@ -566,7 +684,7 @@ pub struct LLMPreferences {
 
 impl LLMPreferences {
     pub fn new(ctx: &mut ModelContext<Self>) -> Self {
-        let models_by_feature = get_cached_models(ctx).unwrap_or_default();
+        let models_by_feature = byob_models_by_feature();
 
         ctx.subscribe_to_model(&NetworkStatus::handle(ctx), |me, event, ctx| {
             if let NetworkStatusEvent::NetworkStatusChanged {
@@ -1062,61 +1180,27 @@ impl LLMPreferences {
         *last_update.popup_visibility_state.lock() = UpdatePopupVisibilityState::Hidden;
     }
 
-    /// Fetches the latest set of models from the server for the currently logged in user, and updates the model.
+    /// BYOB builds use a local static model catalog instead of Warp's cloud model registry.
     pub fn refresh_authed_models(&self, ctx: &mut ModelContext<Self>) {
-        // Don't try to fetch auth'd models if the user is not logged in yet.
-        if !AuthStateProvider::as_ref(ctx).get().is_logged_in() {
-            return;
-        }
-
-        let ai_api_client = ServerApiProvider::as_ref(ctx).get_ai_client();
-        ctx.spawn(
-            async move { ai_api_client.get_feature_model_choices().await },
-            |me, result, ctx| match result {
-                Ok(update) => {
-                    if update != me.models_by_feature {
-                        me.on_server_update(update, ctx);
-                    }
-                }
-                Err(e) => {
-                    report_error!(e.context("Failed to fetch LLMs from server"));
-                }
-            },
-        );
+        ctx.emit(LLMPreferencesEvent::UpdatedAvailableLLMs);
     }
 
     /// No auth required (i.e. to populate the pre-login onboarding picker).
     fn refresh_public_models(&self, ctx: &mut ModelContext<Self>) {
-        let ai_api_client = ServerApiProvider::as_ref(ctx).get_ai_client();
-        ctx.spawn(
-            async move { ai_api_client.get_free_available_models(None).await },
-            |me, result, ctx| match result {
-                Ok(update) => {
-                    if update != me.models_by_feature {
-                        me.on_server_update(update, ctx);
-                    }
-                }
-                Err(e) => {
-                    report_error!(e.context("Failed to fetch free-tier LLMs from server"));
-                }
-            },
-        );
+        ctx.emit(LLMPreferencesEvent::UpdatedAvailableLLMs);
     }
 
     pub fn refresh_available_models(&self, ctx: &mut ModelContext<Self>) {
-        if AuthStateProvider::as_ref(ctx).get().is_logged_in() {
-            self.refresh_authed_models(ctx);
-        } else {
-            self.refresh_public_models(ctx);
-        }
+        self.refresh_public_models(ctx);
     }
 
     pub fn update_feature_model_choices(
         &mut self,
-        choices_result: Result<ModelsByFeature, anyhow::Error>,
+        _choices_result: Result<ModelsByFeature, anyhow::Error>,
         ctx: &mut ModelContext<Self>,
     ) {
-        if let Ok(choices) = choices_result {
+        let choices = byob_models_by_feature();
+        if choices != self.models_by_feature {
             self.on_server_update(choices, ctx);
         }
     }

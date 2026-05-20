@@ -9,7 +9,7 @@ Param (
     [Alias('check-only')]
     [Switch]$CHECK_ONLY,
 
-    [ValidateSet('local', 'dev', 'preview', 'stable', 'oss')]
+    [ValidateSet('local', 'dev', 'preview', 'stable', 'oss', 'warpoca')]
     [String]$CHANNEL = 'dev',
 
     [Alias('release-tag')]
@@ -113,6 +113,13 @@ if ("$CHANNEL" -eq 'local') {
     # The OSS channel does not ship Sentry, so drop the crash_reporting feature
     # (which would otherwise pull in the Sentry SDK as a dependency).
     $FEATURES = 'release_bundle,gui'
+} elseif ("$CHANNEL" -eq 'warpoca') {
+    $WARP_BIN = 'warp-oss'
+    $BINARY_NAME = 'WarpOCA.exe'
+    $APP_NAME = 'WarpOCA'
+    # WarpOCA uses the OSS binary entrypoint with Oracle branding and the
+    # bundled local proxy, without Sentry/crash-reporting cloud dependencies.
+    $FEATURES = 'release_bundle,gui'
 }
 
 if (("$CHANNEL" -eq 'local') -or ("$CHANNEL" -eq 'dev')) {
@@ -127,6 +134,7 @@ $INSTALLER_OUTPUT_DIR = "$WINDOWS_INSTALLER_DIR\Output"
 $INSTALLER_NAME = "$($APP_NAME)$($FILE_ENDING)"
 $INSTALLER_PATH = "$($INSTALLER_OUTPUT_DIR)\$($INSTALLER_NAME).exe"
 $PDB_PATH = "$CARGO_TARGET_OUTPUT_DIR\$WARP_BIN.pdb"
+$RESOURCE_CHANNEL = if ("$CHANNEL" -eq 'warpoca') { 'oss' } else { $CHANNEL }
 
 # The CARGO_FULL_PROFILE environment variable is read by the `cargo` build
 # script (`app/build.rs`) to determine where to place `conpty.dll`.
@@ -150,7 +158,7 @@ if ($CHECK_ONLY) {
 
 if (-Not $SKIP_BUILD_BINARY) {
     Write-Output "Building Warp for channel $CHANNEL and bundle id $BUNDLE_ID"
-    $env:CARGO_BIN_NAME = $CHANNEL
+    $env:CARGO_BIN_NAME = $RESOURCE_CHANNEL
     $env:WARP_APP_NAME = $APP_NAME
     cargo build -p warp --profile "$CARGO_PROFILE" --bin "$WARP_BIN" --features "$FEATURES" --target $PLATFORM_TARGET
     if (-Not $?) {
@@ -180,10 +188,17 @@ if ($SKIP_BUILD_INSTALLER) {
 
 Write-Output "Built for $ARCH with executable at $BINARY_PATH"
 
+Write-Output 'Building WarpOCA proxy helper'
+cargo build -p byob_proxy --profile "$CARGO_PROFILE" --target $PLATFORM_TARGET
+if (-Not $?) {
+    Write-Error "Failed to build byob_proxy helper with profile $CARGO_PROFILE"
+    exit 1
+}
+
 # Prepare bundled resources
 $BUNDLED_RESOURCES_DIR = "$CARGO_TARGET_OUTPUT_DIR\resources"
 Write-Output "Preparing bundled resources..."
-& "$WINDOWS_INSTALLER_DIR\prepare_bundled_resources.ps1" -DestinationDir "$BUNDLED_RESOURCES_DIR" -Channel "$CHANNEL" -CargoProfile "$CARGO_PROFILE"
+& "$WINDOWS_INSTALLER_DIR\prepare_bundled_resources.ps1" -DestinationDir "$BUNDLED_RESOURCES_DIR" -Channel "$RESOURCE_CHANNEL" -CargoProfile "$CARGO_PROFILE"
 if (-Not $?) {
     Write-Error "Failed to prepare bundled resources"
     exit 1
@@ -198,7 +213,8 @@ $ISCC_ARGS = @(
     "/DMyAppName=$APP_NAME",
     "/DMyAppVersion=$env:GIT_RELEASE_TAG",
     "/DArch=$ARCH",
-    "/DOutputName=$INSTALLER_NAME"
+    "/DOutputName=$INSTALLER_NAME",
+    "/DIconChannel=$RESOURCE_CHANNEL"
 )
 # Also accept the sign tool command via env var
 if (-not $SIGN_TOOL_CMD -and $env:SIGN_TOOL_CMD) {

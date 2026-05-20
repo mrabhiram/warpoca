@@ -12,6 +12,8 @@ mod auth;
 mod autoupdate;
 mod banner;
 mod billing;
+#[cfg(all(target_os = "macos", not(target_family = "wasm")))]
+mod byob_proxy;
 mod changelog_model;
 mod chip_configurator;
 mod cloud_object;
@@ -827,6 +829,13 @@ fn run_internal(mut launch_mode: LaunchMode) -> Result<()> {
     }
 
     timer.mark_interval_end("LOG_FILE_SETUP_COMPLETE");
+
+    #[cfg(all(target_os = "macos", not(target_family = "wasm")))]
+    if matches!(&launch_mode, LaunchMode::App { .. }) {
+        if let Err(err) = byob_proxy::ensure_started() {
+            log::error!("WarpOCA proxy setup failed: {err:#}");
+        }
+    }
 
     #[cfg(windows)]
     platform::windows::check_redirection_guard();

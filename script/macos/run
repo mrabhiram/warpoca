@@ -25,8 +25,8 @@ if [ "$WARP_CHANNEL" = "local" ]; then
     WARP_APP_PATH="target/debug/bundle/osx/WarpLocal.app"
     WARP_SCHEME_NAME="warplocal"
 else
-    WARP_APP_PATH="target/debug/bundle/osx/WarpOss.app"
-    WARP_SCHEME_NAME="warposs"
+    WARP_APP_PATH="target/debug/bundle/osx/WarpOCA.app"
+    WARP_SCHEME_NAME="warpoca"
 fi
 DONT_OPEN=false
 # Launches the binary with "open", meaning the Warp process is
@@ -40,6 +40,8 @@ OPEN_WITH_LAUNCHD=false
 # This is not supported when opening with launchd, as passing CLI arguments to
 # an application doesn't make sense.
 WARP_ARGS=()
+BYOB_PROXY_PROFILE_DIR="debug"
+BYOB_PROXY_CARGO_ARGS=()
 
 # Export this variable so it can be referenced by app/build.rs later when
 # running `cargo bundle`.
@@ -62,8 +64,10 @@ while (( "$#" )); do
       if [ "$WARP_CHANNEL" = "local" ]; then
           WARP_APP_PATH="target/release/bundle/osx/WarpLocal.app"
       else
-          WARP_APP_PATH="target/release/bundle/osx/WarpOss.app"
+          WARP_APP_PATH="target/release/bundle/osx/WarpOCA.app"
       fi
+      BYOB_PROXY_PROFILE_DIR="release"
+      BYOB_PROXY_CARGO_ARGS=("--release")
       PARAMS="$PARAMS $1"
       shift
       ;;
@@ -73,8 +77,10 @@ while (( "$#" )); do
       if [ "$WARP_CHANNEL" = "local" ]; then
           WARP_APP_PATH="target/${PROFILE}/bundle/osx/WarpLocal.app"
       else
-          WARP_APP_PATH="target/${PROFILE}/bundle/osx/WarpOss.app"
+          WARP_APP_PATH="target/${PROFILE}/bundle/osx/WarpOCA.app"
       fi
+      BYOB_PROXY_PROFILE_DIR="$PROFILE"
+      BYOB_PROXY_CARGO_ARGS=("--profile" "$PROFILE")
       PARAMS="$PARAMS --profile $PROFILE"
       ;;
     --open_with_launchd)
@@ -96,7 +102,7 @@ rm -rf "$WARP_APP_PATH"
 
 pushd app > /dev/null
 echo "Bundling app (bin: $WARP_BIN_NAME)..."
-cargo bundle --bin "$WARP_BIN_NAME" --features "$FEATURES" $PARAMS
+TERM=xterm-256color cargo bundle --bin "$WARP_BIN_NAME" --features "$FEATURES" $PARAMS
 echo "Successfully bundled..."
 popd > /dev/null
 
@@ -125,6 +131,13 @@ if [[ ",$FEATURES," =~ ",heap_usage_tracking," ]]; then
   HELPERS_DIR="$WARP_APP_PATH/Contents/Helpers"
   "${REPO_ROOT}/script/prepare_bundled_pprof" "$HELPERS_DIR"
 fi
+
+echo "Bundling WarpOCA proxy helper..."
+cargo build -p byob_proxy "${BYOB_PROXY_CARGO_ARGS[@]}"
+HELPERS_DIR="$WARP_APP_PATH/Contents/Helpers"
+mkdir -p "$HELPERS_DIR"
+cp "$REPO_ROOT/target/$BYOB_PROXY_PROFILE_DIR/byob_proxy" "$HELPERS_DIR/byob_proxy"
+chmod +x "$HELPERS_DIR/byob_proxy"
 
 echo "Codesigning app..."
 SIGNING_CERT="$(security find-identity -p codesigning -v | grep "Apple Development" | awk '{print $2}' | head -1)"

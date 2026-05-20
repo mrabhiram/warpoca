@@ -193,6 +193,7 @@ use crate::view_components::DismissibleToast;
 use crate::workspace::{ForkAIConversationParams, ForkedConversationDestination, WorkspaceAction};
 use crate::{report_error, report_if_error, ToastStack};
 use ai::agent::action::{AskUserQuestionItem, InsertReviewComment, RunAgentsRequest};
+use ai::project_context::model::ProjectContextModel;
 
 use crate::editor::InteractionState;
 use crate::server::telemetry::{AutonomySettingToggleSource, InteractionSource};
@@ -2343,8 +2344,11 @@ impl AIBlock {
             };
 
             for rule in suggestions.rules.into_iter() {
+                let local_rule_marker =
+                    format!("warpoca-suggested-logging-id: {}", rule.logging_id);
                 if existing_rules.contains(&rule.logging_id)
                     || existing_suggestions.contains(&rule.logging_id)
+                    || ProjectContextModel::as_ref(ctx).global_rule_contains(&local_rule_marker)
                 {
                     continue;
                 }
