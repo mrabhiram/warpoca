@@ -5,7 +5,7 @@ use std::{
     convert::Infallible,
     env, fs,
     net::SocketAddr,
-    path::PathBuf,
+    path::{Path, PathBuf},
     pin::Pin,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -178,7 +178,8 @@ fn default_agent_system_prompt() -> &'static str {
      call tools for terminal work, observe the returned output, adapt, and finish with a clear conclusion. \
      Do not emit only tool calls when a short user-facing status sentence would help. \
      Never claim a command ran, a file changed, or a remote host state was verified until Warp returns the tool result. \
-     If a command is still running, monitor it with the long-running command tools and explain what you observe."
+     If a command is still running, monitor it with the long-running command tools and explain what you observe. \
+     When the user asks you to remember, store, save, or reuse troubleshooting knowledge, persist a concise local knowledge note."
 }
 
 fn env_var_nonempty(name: &str) -> Option<String> {
@@ -252,6 +253,23 @@ fn byob_config_candidates() -> Vec<PathBuf> {
                 .map(move |name| root.join(name).join("config.json"))
         })
         .collect()
+}
+
+fn warpoca_app_support_dir() -> Option<PathBuf> {
+    env_var_nonempty("BYOB_WARPOCA_APP_SUPPORT_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            app_support_roots()
+                .into_iter()
+                .next()
+                .map(|root| root.join("WarpOCA"))
+        })
+}
+
+fn warpoca_knowledge_dir() -> Option<PathBuf> {
+    env_var_nonempty("BYOB_KNOWLEDGE_DIR")
+        .map(PathBuf::from)
+        .or_else(|| warpoca_app_support_dir().map(|root| root.join("knowledge")))
 }
 
 fn app_support_roots() -> Vec<PathBuf> {
@@ -817,12 +835,24 @@ async fn proxy_multi_agent(
                 let mut unsupported = Vec::new();
                 let mut warp_tool_calls = Vec::new();
                 let mut suggestions = api::Suggestions::default();
+                let mut saved_knowledge_messages = Vec::new();
                 for result in tool_calls.into_warp_client_outputs() {
                     match result {
                         Ok(WarpClientOutput::ToolCall(call)) => warp_tool_calls.push(call),
                         Ok(WarpClientOutput::Suggestions(new_suggestions)) => {
                             suggestions.rules.extend(new_suggestions.rules);
                             suggestions.workflows.extend(new_suggestions.workflows);
+                        }
+                        Ok(WarpClientOutput::LocalKnowledge(args)) => {
+                            match save_local_knowledge(&args) {
+                                Ok(path) => saved_knowledge_messages.push(format!(
+                                    "Saved local knowledge: {}",
+                                    path.display()
+                                )),
+                                Err(err) => unsupported.push(format!(
+                                    "save_knowledge failed: {err}"
+                                )),
+                            }
                         }
                         Err(err) => {
                             unsupported.push(err.to_string());
@@ -832,6 +862,12 @@ async fn proxy_multi_agent(
 
                 if !unsupported.is_empty() {
                     let message = format!("Unsupported or malformed backend tool call: {}", unsupported.join("; "));
+                    if let Some(event) = text_delta_event(&ids, &mut output_message_id, &message) {
+                        yield Ok(event);
+                    }
+                }
+
+                for message in saved_knowledge_messages {
                     if let Some(event) = text_delta_event(&ids, &mut output_message_id, &message) {
                         yield Ok(event);
                     }
@@ -2231,6 +2267,10 @@ fn build_chat_request(request: &api::Request, config: &Config) -> OpenAIChatRequ
         messages.push(OpenAIChatMessage::system(context_summary));
     }
 
+    if let Some(knowledge_context) = local_knowledge_context(&request_knowledge_query(request)) {
+        messages.push(OpenAIChatMessage::system(knowledge_context));
+    }
+
     if let Some(task_context) = &request.task_context {
         for task in &task_context.tasks {
             for message in &task.messages {
@@ -2268,6 +2308,188 @@ fn selected_model(request: &api::Request) -> Option<String> {
     .map(ToOwned::to_owned)
 }
 
+const LOCAL_KNOWLEDGE_MAX_FILES: usize = 6;
+const LOCAL_KNOWLEDGE_FILE_CHAR_LIMIT: usize = 3000;
+
+#[allow(deprecated)]
+fn request_knowledge_query(request: &api::Request) -> String {
+    let mut parts = Vec::new();
+
+    if let Some(input) = &request.input {
+        if let Some(input_type) = &input.r#type {
+            match input_type {
+                api::request::input::Type::UserInputs(user_inputs) => {
+                    for input in &user_inputs.inputs {
+                        let Some(user_input) = &input.input else {
+                            continue;
+                        };
+                        match user_input {
+                            api::request::input::user_inputs::user_input::Input::UserQuery(query) => {
+                                parts.push(query.query.clone());
+                            }
+                            api::request::input::user_inputs::user_input::Input::CliAgentUserQuery(query) => {
+                                if let Some(query) = &query.user_query {
+                                    parts.push(query.query.clone());
+                                }
+                                if let Some(command) = &query.running_command {
+                                    parts.push(command.command.clone());
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                api::request::input::Type::QueryWithCannedResponse(query) => {
+                    parts.push(query.query.clone());
+                }
+                api::request::input::Type::AutoCodeDiffQuery(query) => {
+                    parts.push(query.query.clone());
+                }
+                api::request::input::Type::CreateNewProject(query) => {
+                    parts.push(query.query.clone());
+                }
+                api::request::input::Type::CloneRepository(query) => {
+                    parts.push(query.url.clone());
+                }
+                api::request::input::Type::SummarizeConversation(query) => {
+                    parts.push(query.prompt.clone());
+                }
+                api::request::input::Type::CreateEnvironment(query) => {
+                    parts.extend(query.repo_paths.clone());
+                }
+                api::request::input::Type::FetchReviewComments(query) => {
+                    parts.push(query.repo_path.clone());
+                }
+                api::request::input::Type::InvokeSkill(query) => {
+                    if let Some(query) = &query.user_query {
+                        parts.push(query.query.clone());
+                    }
+                }
+                api::request::input::Type::UserQuery(query) => {
+                    parts.push(query.query.clone());
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(context) = &input.context {
+            for command in &context.executed_shell_commands {
+                parts.push(command.command.clone());
+                parts.push(command.output.clone());
+            }
+        }
+    }
+
+    if parts.is_empty() {
+        if let Some(task_context) = &request.task_context {
+            for task in &task_context.tasks {
+                for message in &task.messages {
+                    if let Some(api::message::Message::UserQuery(query)) = &message.message {
+                        parts.push(query.query.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    parts.join("\n")
+}
+
+fn local_knowledge_context(query: &str) -> Option<String> {
+    let dir = warpoca_knowledge_dir()?;
+    local_knowledge_context_from_dir(&dir, query)
+}
+
+fn local_knowledge_context_from_dir(dir: &Path, query: &str) -> Option<String> {
+    let entries = fs::read_dir(dir).ok()?;
+    let terms = query_terms(query);
+    let wants_knowledge = query_contains_knowledge_request(query);
+    let mut files = Vec::new();
+
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if !path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+        {
+            continue;
+        }
+
+        let Ok(content) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let score = score_knowledge(&content, &terms);
+        if score > 0 || wants_knowledge {
+            files.push((score, path, content));
+        }
+    }
+
+    files.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| left.1.file_name().cmp(&right.1.file_name()))
+    });
+
+    let mut selected = files.into_iter().take(LOCAL_KNOWLEDGE_MAX_FILES).peekable();
+    selected.peek()?;
+
+    let mut context = String::from(
+        "Local WarpOCA knowledge. Consult this before troubleshooting similar issues. \
+         These notes are local Markdown files saved on this machine; do not treat them as internet facts.\n",
+    );
+    for (score, path, content) in selected {
+        context.push_str("\n---\n");
+        context.push_str(&format!(
+            "knowledge file: {} (match_score={score})\n{}\n",
+            path.display(),
+            truncate(&content, LOCAL_KNOWLEDGE_FILE_CHAR_LIMIT)
+        ));
+    }
+    Some(context)
+}
+
+fn query_terms(query: &str) -> Vec<String> {
+    let mut terms = BTreeSet::new();
+    let mut current = String::new();
+
+    for ch in query.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+            current.push(ch.to_ascii_lowercase());
+        } else if current.len() >= 3 {
+            terms.insert(std::mem::take(&mut current));
+        } else {
+            current.clear();
+        }
+    }
+
+    if current.len() >= 3 {
+        terms.insert(current);
+    }
+
+    terms.into_iter().collect()
+}
+
+fn query_contains_knowledge_request(query: &str) -> bool {
+    let lower = query.to_ascii_lowercase();
+    ["knowledge", "memory", "remember", "stored", "saved"]
+        .iter()
+        .any(|needle| lower.contains(needle))
+}
+
+fn score_knowledge(content: &str, terms: &[String]) -> usize {
+    if terms.is_empty() {
+        return 0;
+    }
+
+    let lower = content.to_ascii_lowercase();
+    terms
+        .iter()
+        .map(|term| lower.matches(term.as_str()).count())
+        .sum()
+}
+
 fn warp_tool_instructions() -> &'static str {
     "Tool mapping:\n\
      - Use run_shell_command for terminal commands. Prefer read-only commands unless mutation is required.\n\
@@ -2277,6 +2499,7 @@ fn warp_tool_instructions() -> &'static str {
      - Use read_skill when the request references a Warp/Codex skill and Warp advertises that tool.\n\
      - Use ask_user_question when progress depends on a user choice. Keep questions concrete and options short.\n\
      - Use apply_file_diffs for file edits. Prefer v4a_updates when possible; otherwise use exact search/replace diffs.\n\
+     - Use save_knowledge when the user explicitly asks to remember, save, store, or reuse troubleshooting knowledge. Save durable symptoms, commands, diagnosis, fix, and caveats; avoid secrets.\n\
      - Use suggest_prompt for passive prompt chips or inline query banners when Warp asks for passive suggestions.\n\
      - Use suggest_rule only for durable rules the user may want to save for future agent runs.\n\
      - For SSH checks, prefer absolute key paths when the working directory is known, IdentitiesOnly=yes, BatchMode=yes, StrictHostKeyChecking=accept-new, and a short ConnectTimeout. If SSH says to log in as another user, retry once with that user and summarize both attempts.\n\
@@ -2581,6 +2804,37 @@ fn build_tool_definitions(request: &api::Request) -> Vec<OpenAITool> {
             },
         });
     }
+    tools.push(OpenAITool {
+        r#type: "function",
+        function: OpenAIFunctionDefinition {
+            name: "save_knowledge",
+            description: "Persist a concise local WarpOCA troubleshooting knowledge note for future agent runs. Use only when the user asks to remember/save/store knowledge, or explicitly approves saving the lesson.",
+            parameters: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["title", "content"],
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "Short title, e.g. OKE node GPU device plugin missing after driver upgrade."
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Markdown note with symptoms, environment, checks, diagnosis, resolution, and caveats. Do not include secrets."
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional searchable tags such as OKE, GPU, NVIDIA, nodepool."
+                    },
+                    "source": {
+                        "type": "string",
+                        "description": "Optional source context, e.g. current terminal session, customer-safe incident alias, or command block summary."
+                    }
+                }
+            }),
+        },
+    });
     if supports_tool(request, api::ToolType::ApplyFileDiffs) {
         tools.push(OpenAITool {
             r#type: "function",
@@ -3977,6 +4231,7 @@ struct ToolCallAccumulatorSet {
 enum WarpClientOutput {
     ToolCall(api::message::ToolCall),
     Suggestions(api::Suggestions),
+    LocalKnowledge(SaveKnowledgeArgs),
 }
 
 impl ToolCallAccumulatorSet {
@@ -4114,6 +4369,7 @@ impl ToolCallAccumulatorSet {
             .filter_map(|result| match result {
                 Ok(WarpClientOutput::ToolCall(call)) => Some(Ok(call)),
                 Ok(WarpClientOutput::Suggestions(_)) => None,
+                Ok(WarpClientOutput::LocalKnowledge(_)) => None,
                 Err(err) => Some(Err(err)),
             })
             .collect()
@@ -4317,6 +4573,10 @@ impl ToolCallAccumulator {
             "suggest_prompt" => {
                 let args: SuggestPromptArgs = serde_json::from_str(&self.arguments)?;
                 api::message::tool_call::Tool::SuggestPrompt(args.into_api())
+            }
+            "save_knowledge" => {
+                let args: SaveKnowledgeArgs = serde_json::from_str(&self.arguments)?;
+                return Ok(WarpClientOutput::LocalKnowledge(args));
             }
             "suggest_rule" => {
                 let args: SuggestRuleArgs = serde_json::from_str(&self.arguments)?;
@@ -4651,6 +4911,137 @@ impl SuggestPromptArgs {
             display_mode: Some(display_mode),
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct SaveKnowledgeArgs {
+    title: String,
+    content: String,
+    #[serde(default)]
+    tags: Vec<String>,
+    source: Option<String>,
+}
+
+fn save_local_knowledge(args: &SaveKnowledgeArgs) -> anyhow::Result<PathBuf> {
+    let dir = warpoca_knowledge_dir()
+        .ok_or_else(|| anyhow::anyhow!("could not resolve WarpOCA knowledge directory"))?;
+    save_local_knowledge_to_dir(args, &dir)
+}
+
+fn save_local_knowledge_to_dir(args: &SaveKnowledgeArgs, dir: &Path) -> anyhow::Result<PathBuf> {
+    fs::create_dir_all(dir)?;
+    let title = args.title.trim();
+    let title = if title.is_empty() {
+        "troubleshooting-note"
+    } else {
+        title
+    };
+    let filename = format!(
+        "{}-{}.md",
+        current_unix_timestamp_secs(),
+        slugify_filename(title)
+    );
+    let path = unique_file_path(dir, &filename);
+    fs::write(&path, format_knowledge_markdown(args))?;
+    Ok(path)
+}
+
+fn format_knowledge_markdown(args: &SaveKnowledgeArgs) -> String {
+    let title = args.title.trim();
+    let title = if title.is_empty() {
+        "Troubleshooting Note"
+    } else {
+        title
+    };
+    let mut markdown = String::new();
+    markdown.push_str(&format!("# {title}\n\n"));
+    markdown.push_str("<!-- warpoca-knowledge: true -->\n\n");
+    if !args.tags.is_empty() {
+        let tags = args
+            .tags
+            .iter()
+            .map(|tag| tag.trim())
+            .filter(|tag| !tag.is_empty())
+            .collect::<Vec<_>>()
+            .join(", ");
+        if !tags.is_empty() {
+            markdown.push_str(&format!("Tags: {tags}\n\n"));
+        }
+    }
+    if let Some(source) = args
+        .source
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        markdown.push_str(&format!("Source: {source}\n\n"));
+    }
+    markdown.push_str(args.content.trim());
+    markdown.push('\n');
+    markdown
+}
+
+fn current_unix_timestamp_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
+}
+
+fn slugify_filename(title: &str) -> String {
+    let mut slug = String::new();
+    let mut last_was_dash = false;
+
+    for ch in title.chars() {
+        let next = if ch.is_ascii_alphanumeric() {
+            Some(ch.to_ascii_lowercase())
+        } else if ch == '-' || ch == '_' || ch.is_whitespace() {
+            Some('-')
+        } else {
+            None
+        };
+
+        let Some(next) = next else {
+            continue;
+        };
+        if next == '-' {
+            if !last_was_dash && !slug.is_empty() {
+                slug.push(next);
+                last_was_dash = true;
+            }
+        } else {
+            slug.push(next);
+            last_was_dash = false;
+        }
+    }
+
+    let slug = slug.trim_matches('-');
+    if slug.is_empty() {
+        "troubleshooting-note".to_string()
+    } else {
+        slug.chars().take(80).collect()
+    }
+}
+
+fn unique_file_path(dir: &Path, filename: &str) -> PathBuf {
+    let mut path = dir.join(filename);
+    if !path.exists() {
+        return path;
+    }
+
+    let (stem, extension) = filename
+        .rsplit_once('.')
+        .map(|(stem, extension)| (stem.to_string(), format!(".{extension}")))
+        .unwrap_or_else(|| (filename.to_string(), String::new()));
+
+    for index in 2.. {
+        path = dir.join(format!("{stem}-{index}{extension}"));
+        if !path.exists() {
+            return path;
+        }
+    }
+
+    unreachable!("unbounded file suffix search should always return")
 }
 
 #[derive(Debug, Deserialize)]
@@ -5285,6 +5676,29 @@ mod tests {
     }
 
     #[test]
+    fn saves_and_retrieves_local_knowledge() {
+        let dir = std::env::temp_dir().join(format!("warpoca-knowledge-test-{}", Uuid::new_v4()));
+        let args = SaveKnowledgeArgs {
+            title: "OKE GPU plugin missing".to_string(),
+            content: "Symptoms: OKE GPU nodes show no allocatable nvidia.com/gpu.\nResolution: verify the NVIDIA device plugin DaemonSet and node labels.".to_string(),
+            tags: vec!["OKE".to_string(), "GPU".to_string(), "NVIDIA".to_string()],
+            source: Some("unit test".to_string()),
+        };
+
+        let path = save_local_knowledge_to_dir(&args, &dir).unwrap();
+        let written = fs::read_to_string(&path).unwrap();
+        assert!(written.contains("# OKE GPU plugin missing"));
+        assert!(written.contains("warpoca-knowledge: true"));
+
+        let context = local_knowledge_context_from_dir(&dir, "check knowledge for OKE GPU")
+            .expect("saved knowledge should be included");
+        assert!(context.contains("OKE GPU plugin missing"));
+        assert!(context.contains("NVIDIA device plugin"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn parses_responses_text_delta() {
         let mut calls = ToolCallAccumulatorSet::default();
         let text = parse_responses_sse_data(
@@ -5377,6 +5791,27 @@ mod tests {
             &outputs[0],
             Ok(WarpClientOutput::Suggestions(suggestions))
                 if suggestions.rules.first().is_some_and(|rule| rule.logging_id == "rule_1")
+        ));
+    }
+
+    #[test]
+    fn parses_save_knowledge_tool_call_to_local_output() {
+        let mut calls = ToolCallAccumulatorSet::default();
+        calls.apply_full_calls(vec![OpenAIMessageToolCall {
+            id: "call_memory".to_string(),
+            r#type: "function".to_string(),
+            function: OpenAIFunctionCall {
+                name: "save_knowledge".to_string(),
+                arguments: r#"{"title":"OKE lesson","content":"Check nodepool GPU labels.","tags":["OKE","GPU"]}"#
+                    .to_string(),
+            },
+        }]);
+
+        let outputs = calls.into_warp_client_outputs();
+        assert!(matches!(
+            &outputs[0],
+            Ok(WarpClientOutput::LocalKnowledge(args))
+                if args.title == "OKE lesson" && args.tags == vec!["OKE".to_string(), "GPU".to_string()]
         ));
     }
 }
